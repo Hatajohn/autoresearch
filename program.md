@@ -112,3 +112,30 @@ The idea is that you are a completely autonomous researcher trying things out. I
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+
+## Previous Sessions
+
+Session notes are stored in `sessions/session_<date>_<n>.md`. Read the most recent one during setup to inherit prior findings, the current best config, and the ideas queue.
+
+### autoresearch/mar15 — best: val_bpb=0.455852 (Exp 7, commit `122d714`)
+
+See `sessions/session_mar15_1.md` for full experiment log.
+
+**Winning config** (what's currently on the branch):
+- `TOTAL_BATCH_SIZE = 2**14`
+- `DEVICE_BATCH_SIZE = 8`
+- `DEPTH = 8`, `WEIGHT_DECAY = 0.0`, `MATRIX_LR = 0.04`, `WARMDOWN_RATIO = 0.5`
+
+**Key findings:**
+- Underfitting regime: removing `WEIGHT_DECAY` (0.2→0.0) was the biggest single win (-0.017 bpb)
+- Batch size sweet spot: 2\*\*14 (16K tokens/step) beats both larger and smaller
+- DEPTH=8 is the sweet spot — DEPTH=6 undertrained, DEPTH=10 OOM'd and converged slower
+- Warmdown matters: reducing `WARMDOWN_RATIO` from 0.5 to 0.3 hurt
+
+**Ideas queue (not yet tried):**
+- GQA: `n_kv_head = n_head // 2` (commit `4008453` staged but not run — cancelled)
+- Higher `EMBEDDING_LR` (currently 0.6, try 1.0 — underfitting hypothesis)
+- Wider model: `ASPECT_RATIO = 80` instead of 64
+- More Muon momentum: `ADAM_BETAS = (0.9, 0.95)` instead of `(0.8, 0.95)`
+- Faster Muon: `ns_steps = 3` instead of 5 (cheaper orthogonalization → more wall-clock steps)
+- Non-zero `FINAL_LR_FRAC` (e.g. 0.05) to prevent LR collapsing to zero
