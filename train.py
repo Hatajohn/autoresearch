@@ -7,6 +7,7 @@ Usage: uv run train.py
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["PYTHONUNBUFFERED"] = "1"  # flush stdout immediately even when redirected to file
 
 import gc
 import math
@@ -17,11 +18,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+try:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    print(f"Flash Attention 3 loaded (repo={repo}, cap={cap})", flush=True)
+except Exception as e:
+    print(f"Flash Attention 3 unavailable ({e}), falling back to torch SDPA.", flush=True)
+    fa3 = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +96,18 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if fa3 is not None:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            q_ = q.transpose(1, 2)
+            k_ = k.transpose(1, 2)
+            v_ = v.transpose(1, 2)
+            if self.n_kv_head != self.n_head:
+                groups = self.n_head // self.n_kv_head
+                k_ = k_.repeat_interleave(groups, dim=1)
+                v_ = v_.repeat_interleave(groups, dim=1)
+            y = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
+            y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -458,13 +475,15 @@ t_start = time.time()
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
+print("Loading tokenizer...", flush=True)
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
+print(f"Vocab size: {vocab_size:,}", flush=True)
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -479,10 +498,12 @@ def build_model_config(depth):
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
+print("Initializing model...", flush=True)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+print(f"  model init done", flush=True)
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -505,13 +526,16 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+print("Compiling model (first run: slow, cached thereafter)...", flush=True)
 model = torch.compile(model, dynamic=False)
 
+print("Prefetching first batch...", flush=True)
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Time budget: {TIME_BUDGET}s", flush=True)
+print(f"Gradient accumulation steps: {grad_accum_steps}", flush=True)
+print("Starting training loop...", flush=True)
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
