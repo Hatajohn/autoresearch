@@ -40,6 +40,7 @@
 |---|---|---|---|---|---|
 | baseline | 2c82e32 | 1.186619 | 3.3 | **keep** | Stock defaults: WEIGHT_DECAY=0.2, WARMDOWN=0.5, EMBED_LR=0.6, UNEMBED_LR=0.004, DEVICE_BS=8, TOTAL_BS=2**19 — 164 steps/86M tok |
 | 1 | 66b49f1 | 1.207893 | 3.3 | discard | All 4 Windows LR wins combined — hurt because WARMDOWN=0.7 leaves only 49 of 164 steps at full LR (too aggressive) |
+| 2 | 8ef66cb | 1.178470 | 3.3 | **keep** | Stock settings + infra changes (checkpoint save, `__main__` guard) — 173 steps/90M tok (TIME_BUDGET=300) |
 
 ## Key Findings
 
@@ -55,10 +56,14 @@
 
 6. **First run cold start**: torch.compile + FA3 compilation takes ~20 min cold but is cached. All subsequent runs start in ~20s.
 
+7. **DEVICE_BATCH_SIZE=64 compilation is impractical.** With `torch.compile(dynamic=False)`, changing batch size forces full recompilation of all kernel shapes. At BS=64 this took 15+ minutes — longer than the entire training budget. DEVICE_BATCH_SIZE=32 (grad_accum=8) is the next attempt; smaller shape change from BS=8 may compile faster.
+
+8. **Inference/sampling works via sample.py.** Added `checkpoint.pt` saving after each training run and `sample.py` for interactive sampling. Model output at 90M tokens is incoherent (expected) — needs orders of magnitude more tokens to produce meaningful text on internet-scale data.
+
 ## Next Experiments (Priority Order)
 
-- [ ] **Exp 2**: `DEVICE_BATCH_SIZE` 8→64 (grad_accum 32→4, expect ~400+ steps, proper GPU utilization)
-- [ ] **Exp 3**: If exp 2 OOMs, try 32 instead
+- [x] **Exp 2**: `DEVICE_BATCH_SIZE` 8→64 — killed after 15+ min compilation (torch.compile recompiles all kernel shapes for new BS)
+- [ ] **Exp 3**: `DEVICE_BATCH_SIZE` 8→32 (grad_accum 32→8, ~2x steps, smaller compilation delta)
 - [ ] **Exp 4**: `TOTAL_BATCH_SIZE` 2\*\*19→2\*\*17 (more optimizer steps at same micro-batch size)
 - [ ] **Exp 5**: `UNEMBEDDING_LR` 0.004→0.010 alone (biggest single Windows win — likely transfers)
 - [ ] **Exp 6**: `WEIGHT_DECAY` 0.2→0.0 alone (check if climbmix is also underfitting)
