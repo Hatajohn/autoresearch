@@ -27,7 +27,7 @@ flowchart TD
             PROJ_S["Linear(512→512)"]
             CONV --> PROJ_S
         end
-        SUMM_SKIP{"i ∈ {2,4}?"}
+        SUMM_SKIP{"layer 2 or 4?"}
 
         subgraph BLOCK["③ Block  (pre-norm)"]
             direction TB
@@ -85,7 +85,7 @@ flowchart TD
             MU --> SAMP
             LS --> SAMP --> KL_OUT
         end
-        SL_SKIP{"i ∈ {2,5}?"}
+        SL_SKIP{"layer 2 or 5?"}
 
         HIST["⑧ history.rotate()\ndrop oldest, append x.detach()"]
 
@@ -162,16 +162,7 @@ Three available patterns — window size per layer:
 ```mermaid
 %%{init: {'theme': 'dark'}}%%
 xychart-beta
-    title "PROGRESSIVE  (current default) — 2 unique FA3 kernels"
-    x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
-    y-axis "Window (tokens)" 0 --> 2200
-    bar  [1024, 1024, 1024, 1024, 2048, 2048, 2048, 2048]
-```
-
-```mermaid
-%%{init: {'theme': 'dark'}}%%
-xychart-beta
-    title "LOG  (new) — ~1.3× per layer, 8 unique FA3 kernels"
+    title "LOG (default) - geometric ~1.3x per layer, 8 kernels"
     x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
     y-axis "Window (tokens)" 0 --> 2200
     bar  [256, 384, 512, 640, 896, 1152, 1536, 2048]
@@ -180,19 +171,28 @@ xychart-beta
 ```mermaid
 %%{init: {'theme': 'dark'}}%%
 xychart-beta
-    title "SSSL  (original) — alternating, 2 unique FA3 kernels"
+    title "PROGRESSIVE - step at n//2, 2 kernels"
+    x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
+    y-axis "Window (tokens)" 0 --> 2200
+    bar  [1024, 1024, 1024, 1024, 2048, 2048, 2048, 2048]
+```
+
+```mermaid
+%%{init: {'theme': 'dark'}}%%
+xychart-beta
+    title "SSSL (original) - alternating, 2 kernels"
     x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
     y-axis "Window (tokens)" 0 --> 2200
     bar  [1024, 1024, 1024, 2048, 1024, 1024, 1024, 2048]
 ```
 
-| Pattern | Min window | Scaling | Unique kernels | Cold-cache cost |
-|---------|-----------|---------|----------------|-----------------|
-| `SSSL` | 1024 | Alternating | 2 | Low |
-| `PROGRESSIVE` | 1024 | Step at n//2 | 2 | Low |
-| `LOG` | 256 | ~1.3× per layer | 8 | Higher (one-time) |
+| Pattern | Min window | Scaling | Unique kernels | Default |
+|---------|-----------|---------|----------------|---------|
+| `LOG` | 256 | ~1.3× per layer (geometric) | 8 | **yes** |
+| `PROGRESSIVE` | 1024 | Step at n//2 | 2 | — |
+| `SSSL` | 1024 | Alternating | 2 | — |
 
-`LOG` starts narrow (256 = seq/8) so early layers are forced to extract local features, then expands geometrically. `PROGRESSIVE` uses a cruder 2-level split but produces half the unique kernels. `SSSL` is non-monotonic.
+`LOG` starts narrow (256 = seq/8) so early layers are forced to extract local features, then expands geometrically. Each layer sees ~1.3× the context of the previous, matching the DTM timescale hierarchy most closely. The 8 unique FA3 kernels are compiled once and cached to disk; subsequent runs pay no extra startup cost.
 
 ---
 

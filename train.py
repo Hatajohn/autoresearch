@@ -726,7 +726,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "PROGRESSIVE" # DTM-inspired: windows grow with layer depth (1/4→1/2→3/4→full)
+WINDOW_PATTERN = "LOG"          # Geometric: each layer sees ~1.3x more context than the previous
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
