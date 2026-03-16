@@ -1,0 +1,6 @@
+commit	val_bpb	memory_gb	status	description
+2c82e32	1.186619	3.3	keep	baseline (climbmix, FA3+compile, DEVICE_BS=8, TOTAL_BS=2**19, 164 steps/86M tok)
+66b49f1	1.207893	3.3	discard	all 4 Windows wins at once: WARMDOWN=0.7 too aggressive at 164 steps (only 49 steps at full LR)
+8ef66cb	1.178470	3.3	keep	stock settings + checkpoint saving + __main__ guard — 173 steps/90M tok (TIME_BUDGET=300)
+1db8239	1.206693	15.9	keep	Option A generative PC (van Zwol 2024): tanh pred_heads, x0_lambdas removed, pc_loss↓ 0.00195→0.00088
+HEAD	1.203087	15.9	keep	Run 7 (PC_WEIGHT=0.0)=1.2062; Run 8 (PC_WEIGHT=0.01)=1.2031; gap=x0_lambdas not PC signal

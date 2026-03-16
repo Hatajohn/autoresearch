@@ -174,6 +174,11 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        # PC routing strength as a non-persistent buffer so torch.compile sees a
+        # tensor placeholder rather than a Python literal — changing PC_ALPHA between
+        # experiments never invalidates the compiled graph.
+        self.register_buffer("pc_alpha", torch.tensor(PC_ALPHA, dtype=torch.bfloat16),
+                             persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -308,24 +313,29 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        pc_loss = x.new_zeros(1).squeeze()
-        prev_out = x.detach()  # block 0 predicts the initial embedding (generative PC)
+        pc_loss = x.new_zeros(())   # 0-D scalar; torch.compile reuses this allocation
+        prev_out = x.detach()       # block 0 predicts the initial embedding (generative PC)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
             # Generative PC: pred_head_i predicts the layer below from the current output (top-down)
             pred = block.pred_head(norm(x))
-            pred_error = prev_out - pred
-            pc_contrib = (pred_error / (prev_out.norm(dim=-1, keepdim=True) + 1e-6)).pow(2).mean()
+            pc_denom = prev_out.norm(dim=-1, keepdim=True) + 1e-6
+            # Loss path: gradient flows through pred (updates pred_head); fused by compiler.
+            pc_contrib = ((prev_out - pred) / pc_denom).pow(2).mean()
             pc_loss = pc_loss + pc_contrib
+            # Option B: routing path uses fully-detached inputs so the correction tensor
+            # carries no gradient and torch.compile can free it before the backward pass.
+            x = x + self.pc_alpha * ((prev_out - pred.detach()) / pc_denom)
             prev_out = x.detach()
         pc_loss = pc_loss / len(self.transformer.h)
         x = norm(x)
 
         softcap = 15
         logits = self.lm_head(x)
-        logits = logits.float()
+        # Keep logits in bfloat16 — F.cross_entropy promotes internally for log-sum-exp,
+        # so the explicit float32 cast only wastes ~2GB of GPU memory per forward+backward.
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
@@ -492,6 +502,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Predictive coding
 PC_WEIGHT = 0.1         # weight of predictive coding auxiliary loss (tune between 0.01–0.5)
+PC_ALPHA  = 0.1         # Option B: error routing strength into residual stream (0.0 = Option A)
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -559,6 +570,11 @@ if __name__ == "__main__":
 
     print("Compiling model (first run: slow, cached thereafter)...", flush=True)
     model = torch.compile(model, dynamic=False, fullgraph=True)
+
+    # Flush memory fragmentation left by compile workers before training starts.
+    torch.cuda.empty_cache()
+    print(f"GPU memory after compile: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated, "
+          f"{torch.cuda.memory_reserved()/1e9:.2f}GB reserved", flush=True)
 
     print("Prefetching first batch...", flush=True)
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
