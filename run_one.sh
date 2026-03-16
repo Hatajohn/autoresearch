@@ -58,6 +58,11 @@ if pgrep -f "compile_worker" > /dev/null 2>&1; then
     pkill -KILL -f "compile_worker" 2>/dev/null || true
 fi
 
+echo "[run_one] GPU [before]:"
+nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu,memory.used \
+           --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F',' '{printf "  temp=%s°C  power=%.0fW  util=%s%%  mem=%sMiB\n",$1,$2,$3,$4}' || echo "  (nvidia-smi unavailable)"
+
 mkdir -p sessions
 
 # ---------------------------------------------------------------------------
