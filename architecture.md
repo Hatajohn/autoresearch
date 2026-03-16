@@ -155,18 +155,44 @@ flowchart TD
 
 ---
 
-## Attention Windows (PROGRESSIVE pattern, seq=2048)
+## Attention Windows (seq=2048, n=8)
+
+Three available patterns — window size per layer:
 
 ```mermaid
 %%{init: {'theme': 'dark'}}%%
 xychart-beta
-    title "Attention Window Size by Layer"
+    title "PROGRESSIVE  (current default) — 2 unique FA3 kernels"
     x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
-    y-axis "Window size (tokens)" 0 --> 2200
+    y-axis "Window (tokens)" 0 --> 2200
     bar  [1024, 1024, 1024, 1024, 2048, 2048, 2048, 2048]
 ```
 
-Lower half (L0–L3) attends to 1 024 tokens (local). Upper half (L4–L7) attends to the full 2 048-token context. Two levels instead of four cuts the number of unique FA3 kernels compiled, reducing cold-cache startup time.
+```mermaid
+%%{init: {'theme': 'dark'}}%%
+xychart-beta
+    title "LOG  (new) — ~1.3× per layer, 8 unique FA3 kernels"
+    x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
+    y-axis "Window (tokens)" 0 --> 2200
+    bar  [256, 384, 512, 640, 896, 1152, 1536, 2048]
+```
+
+```mermaid
+%%{init: {'theme': 'dark'}}%%
+xychart-beta
+    title "SSSL  (original) — alternating, 2 unique FA3 kernels"
+    x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
+    y-axis "Window (tokens)" 0 --> 2200
+    bar  [1024, 1024, 1024, 2048, 1024, 1024, 1024, 2048]
+```
+
+| Pattern | Min window | Scaling | Unique kernels | Cold-cache cost |
+|---------|-----------|---------|----------------|-----------------|
+| `SSSL` | 1024 | Alternating | 2 | Low |
+| `PROGRESSIVE` | 1024 | Step at n//2 | 2 | Low |
+| `LOG` | 256 | ~1.3× per layer | 8 | Higher (one-time) |
+
+`LOG` starts narrow (256 = seq/8) so early layers are forced to extract local features, then expands geometrically. `PROGRESSIVE` uses a cruder 2-level split but produces half the unique kernels. `SSSL` is non-monotonic.
 
 ---
 

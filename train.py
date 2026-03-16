@@ -387,6 +387,24 @@ class GPT(nn.Module):
                 window_sizes.append((w, 0))
             window_sizes[-1] = (long_window, 0)
             return window_sizes
+        if pattern == "LOG":
+            # Logarithmic (geometric) scaling: each layer sees ~1.3× more context than
+            # the previous.  Minimum window = seq // n_layer (≥ 64); maximum = seq.
+            # Windows are rounded to the nearest 128 tokens for FA3 tile alignment.
+            # Produces n unique kernel variants (one per layer), vs PROGRESSIVE's 2.
+            # Trade-off: richer timescale hierarchy at the cost of a longer cold-cache
+            # compile (paid once; subsequent runs use the kernel cache).
+            tile = 128
+            min_w = max(64, long_window // n)
+            min_w = ((min_w + tile - 1) // tile) * tile  # round up to nearest tile
+            window_sizes = []
+            for i in range(n - 1):
+                t = i / (n - 1)                          # 0.0 → (n-2)/(n-1)
+                w = min_w * (long_window / min_w) ** t   # geometric interpolation
+                w = max(tile, round(w / tile) * tile)    # snap to tile boundary
+                window_sizes.append((w, 0))
+            window_sizes.append((long_window, 0))        # last layer always full context
+            return window_sizes
         assert all(c in "SL" for c in pattern)
         short_window = long_window // 2
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
