@@ -356,7 +356,8 @@ def evaluate_bpb(model, tokenizer, batch_size):
     total_bytes = 0
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
+        loss_flat, _ = model(x, y, reduction='none')
+        loss_flat = loss_flat.view(-1)
         y_flat = y.view(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0

@@ -127,18 +127,28 @@ class MLP(nn.Module):
         return x
 
 
+class PredHead(nn.Module):
+    """Two-layer MLP predictor: out → hidden → prediction of x."""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.fc   = nn.Linear(n_embd, n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def forward(self, x):
+        return self.proj(F.tanh(self.fc(x)))
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-        self.pred_head = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.pred_head = PredHead(config.n_embd)
 
     def forward(self, x, ve, cos_sin, window_size):
         out = x + self.attn(norm(x), ve, cos_sin, window_size)
         out = out + self.mlp(norm(out))
-        pred_error = x - self.pred_head(out)
-        return out, pred_error
+        return out
 
 
 class GPT(nn.Module):
@@ -152,7 +162,6 @@ class GPT(nn.Module):
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -183,7 +192,6 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
         # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
@@ -191,9 +199,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Pred heads init to zero so they start as no-ops
+        # PredHead: fc uniform (learns features), proj zero (no-op at step 0)
         for block in self.transformer.h:
-            torch.nn.init.zeros_(block.pred_head.weight)
+            torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
+            torch.nn.init.zeros_(block.pred_head.proj.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -233,7 +242,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel())
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
@@ -249,7 +258,7 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        scalars = self.resid_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
@@ -259,14 +268,17 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        pred_head_params = [p for block in self.transformer.h
+                            for p in block.pred_head.parameters()]
+        pred_head_param_ids = {id(p) for p in pred_head_params}
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in pred_head_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(pred_head_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -275,7 +287,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            # pred_head in AdamW: kept out of Muon to avoid polluting backbone gradient groups
+            dict(kind='adamw', params=pred_head_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -295,13 +308,19 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        x0 = x
-        pc_errors = []
+        pc_loss = x.new_zeros(1).squeeze()
+        prev_out = x.detach()  # block 0 predicts the initial embedding (generative PC)
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = self.resid_lambdas[i] * x
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x, pred_error = block(x, ve, cos_sin, self.window_sizes[i])
-            pc_errors.append(pred_error.pow(2).mean())
+            x = block(x, ve, cos_sin, self.window_sizes[i])
+            # Generative PC: pred_head_i predicts the layer below from the current output (top-down)
+            pred = block.pred_head(norm(x))
+            pred_error = prev_out - pred
+            pc_contrib = (pred_error / (prev_out.norm(dim=-1, keepdim=True) + 1e-6)).pow(2).mean()
+            pc_loss = pc_loss + pc_contrib
+            prev_out = x.detach()
+        pc_loss = pc_loss / len(self.transformer.h)
         x = norm(x)
 
         softcap = 15
@@ -312,7 +331,6 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
-            pc_loss = torch.stack(pc_errors).mean()
             return loss, pc_loss
         return logits
 
@@ -540,7 +558,7 @@ if __name__ == "__main__":
     )
 
     print("Compiling model (first run: slow, cached thereafter)...", flush=True)
-    model = torch.compile(model, dynamic=False)
+    model = torch.compile(model, dynamic=False, fullgraph=True)
 
     print("Prefetching first batch...", flush=True)
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
