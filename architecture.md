@@ -19,20 +19,27 @@ flowchart TD
         SUMM["TemporalSummarizer  layers 2 and 4 only\nConv1d causal  + Linear  residual add"]
         ATTN["CausalSelfAttention\nRoPE   QK-norm   windowed FA3\nattn_temp^2 precision   value embeds on alt layers"]
         MLP_N["MLP   512 -> 2048 -> 512\nReLU^2 activation"]
-        PRED["PredHead\npredict history skip layers back"]
-        ERR["prediction error\n(target - pred) / pc_scale"]
-        ELBO["ELBO per token  side accumulation\nL^2 * err^2 - log(L^2)  into pc_loss_map"]
-        CORR["top-down correction\nx += gate * alpha * L^2 * error\ngate = sigmoid(routing_gate(x))"]
         STOCH["StochasticLayer  layers 2 and 5 only\nz = mu + noise * sigma   adds KL loss"]
-        HIST["history buffer rotate\nappend x.detach()"]
+        layer_outs["layer_outs[i] = x\ncollect all 8 outputs"]
 
-        SCALE --> SUMM --> ATTN --> MLP_N --> PRED --> ERR
-        ERR -.->|loss accum| ELBO
-        ERR --> CORR --> STOCH --> HIST
+        SCALE --> SUMM --> ATTN --> MLP_N
+        MLP_N --> STOCH --> layer_outs
+    end
+
+    subgraph PHASE2["Phase 2  broadcast PC  after all layers"]
+        BROADCAST["broadcast = norm(layer_outs[-1]).detach()\nfinal layer is the global top-down target"]
+        PRED["PredHead(norm(layer_outs[i]))\npredict broadcast from each layer 0..n-2"]
+        ERR["raw_error = (broadcast - pred) / pc_scale"]
+        ELBO["ELBO  L^2 * err^2 - log(L^2)"]
+        GATE["routing_gate  sigmoid gate  (B,T)\nweights which tokens get strong PC signal"]
+        PCLOSS_A["pc_loss_map += gate * ELBO\ngradient flows back to each layer's params"]
+        BROADCAST --> PRED --> ERR --> ELBO --> PCLOSS_A
+        ERR --> GATE --> PCLOSS_A
     end
 
     N0 --> SCALE
-    HIST --> OUTNORM
+    layer_outs --> BROADCAST
+    layer_outs --> OUTNORM
 
     OUTNORM["RMSNorm"]
     HEAD["lm_head   Linear 512 -> vocab   no bias"]
@@ -51,6 +58,7 @@ flowchart TD
 
     CAP --> CE
 
+    classDef buf   fill:#1e293b,stroke:#64748b,color:#94a3b8,stroke-width:1px
     classDef inp   fill:#1e3a8a,stroke:#60a5fa,color:#e0f2fe,stroke-width:2px
     classDef norm  fill:#312e81,stroke:#818cf8,color:#e0e7ff,stroke-width:1px
     classDef scale fill:#3b0764,stroke:#a855f7,color:#f3e8ff,stroke-width:1px
@@ -70,7 +78,8 @@ flowchart TD
     class SUMM           summ
     class ATTN           attn
     class MLP_N          mlp
-    class PRED,ERR,ELBO,CORR  pc
+    class layer_outs  buf
+    class BROADCAST,PRED,ERR,ELBO,GATE,PCLOSS_A  pc
     class STOCH          stoch
     class HIST           hist
     class HEAD,CAP       out
@@ -121,10 +130,10 @@ xychart-beta
 
 ---
 
-## Skip-Layer PC Targets
+## Broadcast PC Targets
 
 ```mermaid
-%%{init: {'theme': 'dark'}}%%
+%%{init: {"theme": "dark"}}%%
 flowchart LR
     L0["L0"]
     L1["L1"]
@@ -133,31 +142,24 @@ flowchart LR
     L4["L4"]
     L5["L5"]
     L6["L6"]
-    L7["L7"]
-    H1["history[-1]"]
-    H2["history[-2]"]
-    H3["history[-3]"]
-    H4["history[-4]"]
+    L7["L7  broadcast target"]
 
-    L0 & L1 -->|skip 1| H1
-    L2 & L3 -->|skip 2| H2
-    L4 & L5 -->|skip 3| H3
-    L6 & L7 -->|skip 4| H4
+    L0 -->|predict| L7
+    L1 -->|predict| L7
+    L2 -->|predict| L7
+    L3 -->|predict| L7
+    L4 -->|predict| L7
+    L5 -->|predict| L7
+    L6 -->|predict| L7
 
-    classDef shallow  fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:2px
-    classDef mid      fill:#065f46,stroke:#34d399,color:#d1fae5,stroke-width:2px
-    classDef deep     fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
-    classDef deepest  fill:#881337,stroke:#fb7185,color:#ffe4e6,stroke-width:2px
-    classDef hist     fill:#1e293b,stroke:#475569,color:#cbd5e1,stroke-width:2px
+    classDef pred   fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
+    classDef target fill:#4c1d95,stroke:#a78bfa,color:#ede9fe,stroke-width:3px
 
-    class L0,L1  shallow
-    class L2,L3  mid
-    class L4,L5  deep
-    class L6,L7  deepest
-    class H1,H2,H3,H4  hist
+    class L0,L1,L2,L3,L4,L5,L6  pred
+    class L7  target
 ```
 
-Shallow layers predict one step back (local refinement). Deep layers predict up to four steps back, propagating PC error signals from the output all the way to early representations.
+All layers 0..n-2 predict the final layer's normalised output (broadcast target, shown in purple). This is the most faithful implementation of hierarchical predictive coding: the highest level of the hierarchy sets a global top-down prediction that every lower level must learn to match. Layer 7 is detached — it sets the context without receiving gradient through the PC path.
 
 ---
 

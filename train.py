@@ -299,12 +299,6 @@ class GPT(nn.Module):
         # Per-layer learnable precision scalars: weight each layer's PC error contribution.
         # Initialized to 1 (uniform), learned to up/down-weight layers during training.
         self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        # Skip-layer PC schedule: shallow layers predict 1 step back, deeper layers predict
-        # 2 or 3 steps back, creating genuinely long-range top-down signals.
-        # Divides n_layer into thirds; skip distance increases by 1 each third.
-        third = max(1, config.n_layer // 3)
-        self.skip_schedule = [1 + (i // third) for i in range(config.n_layer)]
-        self.history_depth = max(self.skip_schedule) + 1
 
     @torch.no_grad()
     def init_weights(self):
@@ -503,47 +497,53 @@ class GPT(nn.Module):
         x = norm(x)
         pc_loss_map = x.new_zeros(B, T)  # (B, T) per-token accumulator; reduced after logits
         kl_loss = x.new_zeros(())        # scalar KL accumulated across stochastic layers
-        # History buffer for skip-layer PC: history[-1] is most recent, history[-k] is k steps back.
-        # Pre-fill all slots with the initial embedding so every layer has a valid target
-        # regardless of skip distance.  Static length = max_skip + 1 → compile-safe.
-        history = [x.detach()] * self.history_depth
         # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
-        # tensor slice op rather than n_layer separate scalar-index ops, avoiding recompilation.
+        # tensor slice op rather than n_layer separate scalar-index ops.
         resid_scales = self.resid_lambdas.unbind(0)
         lambda_sq = self.pc_lambdas.square()
-        pc_weights          = lambda_sq.unbind(0)          # λᵢ² — precision, used in loss
-        pc_log_weights      = lambda_sq.clamp(min=1e-8).log().unbind(0)  # log(λᵢ²) — ELBO term
-        pc_precision_routing = lambda_sq.detach().unbind(0)               # λᵢ² detached — routing
+        pc_weights     = lambda_sq.unbind(0)
+        pc_log_weights = lambda_sq.clamp(min=1e-8).log().unbind(0)
+
+        # ── Phase 1: standard forward pass ───────────────────────────────────
+        # Run all layers, collecting their outputs.  No PC corrections yet —
+        # the broadcast target (final layer) must exist before any error can
+        # be computed.
+        layer_outs = []
         for i, block in enumerate(self.transformer.h):
             x = resid_scales[i] * x
-            # Soft temporal compression at tier-transition layers (before the block)
             if i in self.summarizer_layers:
                 x = self.summarizers[str(i)](x)
             ve = self.value_embeds[str(i)](idx) if i in self.value_embed_set else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
-            # Skip-layer PC: shallow layers predict 1 step back (adjacent), deep layers
-            # predict 2-3 steps back — increasingly long-range top-down signals.
-            skip = self.skip_schedule[i]   # static Python int at compile time
-            target_out = history[-skip]    # static negative index; no dynamic dispatch
-            pred = block.pred_head(norm(x))
-            # Bogacz (2017) Eq 10-11: errors are normalised by Σ (variance), not ||target||.
-            # We use pc_scale = sqrt(n_embd) as a fixed dim-normaliser; λ² = 1/Σ is learned.
-            raw_error = (target_out - pred) / self.pc_scale    # (B, T, C), dimensionless
-            # Loss path: ELBO = λ² * error² - log(λ²)
-            # Without -log(λ²), λ grows unbounded; with it, λ² → 1/E[error²] at equilibrium.
-            pc_contrib = (pc_weights[i] * raw_error.pow(2).mean(dim=-1)
-                          - pc_log_weights[i])                 # (B, T)
-            pc_loss_map = pc_loss_map + pc_contrib
-            # Routing path: precision-weighted correction — λ² · error (Bogacz Eq 53).
-            # gate ∈ (0,1); sigmoid(0)=0.5 initially → neutral, learns where to correct.
-            gate = torch.sigmoid(block.routing_gate(norm(x)))   # (B, T, 1)
-            x = x + gate * self.pc_alpha * pc_precision_routing[i] * (target_out - pred.detach()) / self.pc_scale
-            # Stochastic reparameterization at designated layers
             if i in self.stochastic_layer_set:
                 x, kl_contrib = self.stochastic_layers[str(i)](x)
                 kl_loss = kl_loss + kl_contrib
-            history = history[1:] + [x.detach()]  # rotate: drop oldest, append current
-        x = norm(x)
+            layer_outs.append(x)
+
+        # ── Phase 2: broadcast predictive coding ────────────────────────────
+        # The final layer's normalised representation is the global top-down
+        # target broadcast to all preceding layers (Bogacz 2017, hierarchical
+        # PC).  It is detached: layer (n-1) sets the context but does not
+        # receive gradient through this path — only predictors (0..n-2) do.
+        #
+        # The routing gate weights which tokens receive a strong PC signal.
+        # At sigmoid(0)=0.5 initialisation every token is weighted equally;
+        # the gate learns to focus on tokens where prediction error is most
+        # informative.  Gradient flows back through the ELBO loss, not through
+        # an explicit residual correction (which would require a second forward
+        # pass to propagate downstream).
+        broadcast = norm(layer_outs[-1]).detach()
+        for i in range(self.config.n_layer - 1):
+            block = self.transformer.h[i]
+            h_i = norm(layer_outs[i])
+            pred = block.pred_head(h_i)
+            raw_error = (broadcast - pred) / self.pc_scale          # (B, T, C)
+            token_pc  = (pc_weights[i] * raw_error.pow(2).mean(dim=-1)
+                         - pc_log_weights[i])                        # (B, T) ELBO
+            gate = torch.sigmoid(block.routing_gate(h_i)).squeeze(-1)  # (B, T)
+            pc_loss_map = pc_loss_map + gate * token_pc
+
+        x = norm(layer_outs[-1])
 
         softcap = 15
         logits = self.lm_head(x)
