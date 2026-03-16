@@ -245,12 +245,25 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
+        n = config.n_layer
         long_window = config.sequence_len
+        if pattern == "PROGRESSIVE":
+            # DTM-inspired: window grows monotonically with layer depth across 4 quantile levels.
+            # Lower layers see local syntax (narrow), higher layers see global context (wide).
+            # Levels: 1/4, 1/2, 3/4, full — assigned by equally-spaced quantile of layer index.
+            levels = 4
+            window_sizes = []
+            for i in range(n):
+                level = min(levels, 1 + (i * levels) // n)  # static int per layer: 1..4
+                w = (long_window * level) // levels
+                window_sizes.append((w, 0))
+            window_sizes[-1] = (long_window, 0)
+            return window_sizes
+        assert all(c in "SL" for c in pattern)
         short_window = long_window // 2
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
         window_sizes = []
-        for layer_idx in range(config.n_layer):
+        for layer_idx in range(n):
             char = pattern[layer_idx % len(pattern)]
             window_sizes.append(char_to_window[char])
         window_sizes[-1] = (long_window, 0)
@@ -504,7 +517,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "PROGRESSIVE" # DTM-inspired: windows grow with layer depth (1/4→1/2→3/4→full)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
