@@ -111,8 +111,9 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         # Apply learnable temperature: higher β → sharper attention (higher precision).
-        # q*β shifts the softmax scale; ε=0.01 keeps gradient smooth near zero.
-        q = q * (self.attn_temp.square() + 0.01)
+        # Compute scale in float32 then cast to q's dtype: .square() on bf16 upcasts to
+        # float32 under autocast, so the .to() must happen AFTER the arithmetic, not before.
+        q = q * (self.attn_temp.square() + 0.01).to(dtype=q.dtype)
 
         if fa3 is not None:
             y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -185,7 +186,8 @@ class StochasticLayer(nn.Module):
         sigma     = log_sigma.exp()
         # noise_scale=1 during training, 0 during eval — tensor branch, not Python bool,
         # so torch.compile emits one graph valid for both modes (no eval recompile).
-        z = mu + self.noise_scale * sigma * torch.randn_like(mu)
+        # Cast to mu's dtype so float32 buffer doesn't upcast bfloat16 activations under autocast.
+        z = mu + self.noise_scale.to(dtype=mu.dtype) * sigma * torch.randn_like(mu)
         # KL(q || N(0,1)) = 0.5 * (sigma² + mu² - log(sigma²) - 1)
         kl = 0.5 * (sigma.pow(2) + mu.pow(2) - 2.0 * log_sigma - 1.0).mean()
         return z, kl
@@ -349,6 +351,15 @@ class GPT(nn.Module):
         self.transformer.wte.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
+        # Scalar buffers are zeroed by meta-device → to_empty() construction — restore
+        # to their intended initial values.  Normal (non-meta) instantiation doesn't need
+        # this, but it is idempotent so safe to call unconditionally.
+        self.pc_alpha.fill_(PC_ALPHA)
+        self.pc_focal_gamma.fill_(PC_FOCAL_GAMMA)
+        self.kl_weight.fill_(KL_WEIGHT)
+        self.pc_scale.fill_(float(self.config.n_embd) ** 0.5)
+        for sl in self.stochastic_layers.values():
+            sl.noise_scale.fill_(1.0)   # start in training mode (1.0 = add noise)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
