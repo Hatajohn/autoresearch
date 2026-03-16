@@ -192,6 +192,12 @@ class GPT(nn.Module):
         # Per-layer learnable precision scalars: weight each layer's PC error contribution.
         # Initialized to 1 (uniform), learned to up/down-weight layers during training.
         self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
+        # Skip-layer PC schedule: shallow layers predict 1 step back, deeper layers predict
+        # 2 or 3 steps back, creating genuinely long-range top-down signals.
+        # Divides n_layer into thirds; skip distance increases by 1 each third.
+        third = max(1, config.n_layer // 3)
+        self.skip_schedule = [1 + (i // third) for i in range(config.n_layer)]
+        self.history_depth = max(self.skip_schedule) + 1
 
     @torch.no_grad()
     def init_weights(self):
@@ -341,7 +347,10 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         pc_loss = x.new_zeros(())   # 0-D scalar; torch.compile reuses this allocation
-        prev_out = x.detach()       # block 0 predicts the initial embedding (generative PC)
+        # History buffer for skip-layer PC: history[-1] is most recent, history[-k] is k steps back.
+        # Pre-fill all slots with the initial embedding so every layer has a valid target
+        # regardless of skip distance.  Static length = max_skip + 1 → compile-safe.
+        history = [x.detach()] * self.history_depth
         # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
         # tensor slice op rather than n_layer separate scalar-index ops, avoiding recompilation.
         resid_scales = self.resid_lambdas.unbind(0)
@@ -350,16 +359,18 @@ class GPT(nn.Module):
             x = resid_scales[i] * x
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
-            # Generative PC: pred_head_i predicts the layer below from the current output (top-down)
+            # Skip-layer PC: shallow layers predict 1 step back (adjacent), deep layers
+            # predict 2-3 steps back — increasingly long-range top-down signals.
+            skip = self.skip_schedule[i]   # static Python int at compile time
+            target_out = history[-skip]    # static negative index; no dynamic dispatch
             pred = block.pred_head(norm(x))
-            pc_denom = prev_out.norm(dim=-1, keepdim=True) + 1e-6
+            pc_denom = target_out.norm(dim=-1, keepdim=True) + 1e-6
             # Loss path: gradient flows through pred (updates pred_head); fused by compiler.
-            pc_contrib = pc_weights[i] * ((prev_out - pred) / pc_denom).pow(2).mean()
+            pc_contrib = pc_weights[i] * ((target_out - pred) / pc_denom).pow(2).mean()
             pc_loss = pc_loss + pc_contrib
-            # Option B: routing path uses fully-detached inputs so the correction tensor
-            # carries no gradient and torch.compile can free it before the backward pass.
-            x = x + self.pc_alpha * ((prev_out - pred.detach()) / pc_denom)
-            prev_out = x.detach()
+            # Routing path: fully-detached correction so CE backprop is unaffected.
+            x = x + self.pc_alpha * ((target_out - pred.detach()) / pc_denom)
+            history = history[1:] + [x.detach()]  # rotate: drop oldest, append current
         pc_loss = pc_loss / len(self.transformer.h)
         x = norm(x)
 
