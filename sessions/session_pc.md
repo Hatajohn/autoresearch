@@ -581,3 +581,41 @@ before the loop gives the compiler a single stable op. Same fix applied to
 **Status: INVALID** — cold kernel cache from new pc2 graph variants.
 Steps 6-8 stalled 157/159/330s, step 27 stalled 639s. `unbind()` fix was not yet
 applied when this run started. Run 14 will be the first valid pc2 result.
+
+---
+
+### Run 14 pc2 — PC_ALPHA=0.1, PC_WEIGHT=0.1, TIME=600s (KILLED — architecture reconfiguration)
+
+| Field | Value |
+|---|---|
+| **val_bpb** | N/A — killed before completion |
+| **Steps completed** | 5 (steps 0–5 only) |
+| **Log** | sessions/run14_pc2_w0.1_a0.1.log |
+
+**Status: KILLED** — User requested architecture reconfiguration mid-run.
+
+**Step timing observed (warm-cache partial run):**
+
+| Step | dt (ms) | Notes |
+|---|---|---|
+| 0 | 429,381 | First-pass Triton kernel compilation |
+| 1 | 35,904 | Still compiling variants |
+| 2 | 46,026 | Still compiling variants |
+| 3 | 41,212 | Still compiling variants |
+| 4 | 310,097 | Large stall — additional kernel variant |
+| 5 | 72,942 | Warming down |
+
+**Key finding: `unbind()` fix is insufficient.** The fix addressed per-layer scalar indexing (`pc_lambdas[i]` → `pc_weights[i]` from unbind), confirmed working in smoke test (second forward 8ms). However, in a full training run, additional Triton kernel variants are triggered beyond what the smoke test covers:
+
+- Step 0: 429s (down from 734s in pc1 and ~2346s total in Run 13 — cache partially warm from Run 13)
+- Steps 1–3: 35–46s each (no analogous stalls in pc1/Run 12 — these steps were ~10s immediately)
+- Step 4: 310s stall (vs. pc1 which was smooth after step 0)
+
+**Root cause hypothesis:** The pc2 graph has more distinct Triton kernel variants than pc1 due to:
+1. `pc_lambdas.square().unbind(0)` — `.square()` + 8×unbind scalars = new ops not in pc1 graph
+2. Residual `PredHead`: `x + proj(tanh(fc(x)))` has an extra residual branch vs. pc1's `proj(tanh(fc(x)))`
+3. The smoke test (B=4, T=256 with a single forward+backward) does not trigger the same kernel variants as full training (B=4×8 micro-steps, T=512, repeated gradient accumulation loop)
+
+The `unbind()` fix resolves the *per-layer re-triggering* but does not eliminate the *initial set of novel kernels* the pc2 graph introduces. Run 14 was killed before the cache could fully warm.
+
+**Architecture is being redesigned.** Next run number: **15**.
