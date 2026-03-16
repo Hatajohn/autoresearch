@@ -378,14 +378,14 @@ class GPT(nn.Module):
         n = config.n_layer
         long_window = config.sequence_len
         if pattern == "PROGRESSIVE":
-            # DTM-inspired: window grows monotonically with layer depth across 4 quantile levels.
-            # Lower layers see local syntax (narrow), higher layers see global context (wide).
-            # Levels: 1/4, 1/2, 3/4, full — assigned by equally-spaced quantile of layer index.
-            levels = 4
+            # DTM-inspired: window grows monotonically with layer depth — 2 levels only.
+            # Lower half of layers: short (half context); upper half: full context.
+            # 2 levels instead of 4 halves the number of unique FA3 kernels to compile,
+            # cutting cold-cache compilation time by ~50% on the attention kernels alone.
+            short_window = long_window // 2
             window_sizes = []
             for i in range(n):
-                level = min(levels, 1 + (i * levels) // n)  # static int per layer: 1..4
-                w = (long_window * level) // levels
+                w = short_window if i < n // 2 else long_window
                 window_sizes.append((w, 0))
             window_sizes[-1] = (long_window, 0)
             return window_sizes
@@ -536,25 +536,31 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            # Multi-timescale auxiliary losses (Parr et al. Section 5.2): predict k tokens ahead.
-            # Reuses existing logits/lm_head — only the target window shifts.
-            # Weights chosen so total aux contribution is ~20% of the main CE loss.
-            for horizon_k, horizon_w in ((2, 0.15), (4, 0.05)):
-                aux = F.cross_entropy(
-                    logits[:, :-horizon_k].contiguous().view(-1, logits.size(-1)),
-                    targets[:, horizon_k:].contiguous().view(-1),
-                    ignore_index=-1, reduction=reduction,
-                )
-                loss = loss + horizon_w * aux
-            # Output-difficulty focal weighting: tokens where the model is most wrong
-            # get the largest PC correction signal.  Fully detached — only scales magnitude.
-            token_loss = F.cross_entropy(
+            # Compute per-token CE once; derive scalar loss and focal map from the same tensor.
+            # One kernel instead of two (old code called cross_entropy with reduction='mean'
+            # AND reduction='none' separately, generating two distinct compiled kernel variants).
+            token_ce = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1),
                 ignore_index=-1, reduction='none',
-            ).view(B, T).detach()
-            difficulty = (token_loss / (token_loss.mean() + 1e-6)).pow(self.pc_focal_gamma)
+            ).view(B, T)
+            if reduction == 'mean':
+                loss = token_ce.mean()
+                # Multi-timescale auxiliary losses (Parr et al. Section 5.2): predict k tokens ahead.
+                # Only added during training (reduction='mean'); evaluate_bpb uses reduction='none'
+                # and the shifted-target windows produce different-sized tensors that can't be summed
+                # with the per-token (B, T) map.
+                for horizon_k, horizon_w in ((2, 0.15), (4, 0.05)):
+                    aux = F.cross_entropy(
+                        logits[:, :-horizon_k].contiguous().view(-1, logits.size(-1)),
+                        targets[:, horizon_k:].contiguous().view(-1),
+                        ignore_index=-1, reduction='mean',
+                    )
+                    loss = loss + horizon_w * aux
+            else:
+                loss = token_ce  # (B, T) per-token losses — used by evaluate_bpb
+            # Output-difficulty focal weighting: tokens where the model is most wrong
+            # get the largest PC correction signal.  Fully detached — only scales magnitude.
+            difficulty = (token_ce.detach() / (token_ce.detach().mean() + 1e-6)).pow(self.pc_focal_gamma)
             pc_loss = (pc_loss_map * difficulty).mean() / len(self.transformer.h)
             # Fold kl_loss into pc_loss before returning so callers (including
             # evaluate_bpb in prepare.py) always receive a 2-tuple (loss, aux_loss).
@@ -804,6 +810,21 @@ if __name__ == "__main__":
 
     print("Compiling model (first run: slow, cached thereafter)...", flush=True)
     model = torch.compile(model, dynamic=False, fullgraph=True)
+
+    # Pre-warm: run one dummy forward+backward to trigger all Triton kernel compilations
+    # before the training loop starts.  This makes step 0 fast and keeps the "Starting
+    # training loop" message honest — all compilation noise is absorbed here.
+    print("Pre-warming kernels (dummy fwd+bwd — may take several minutes on cold cache)...", flush=True)
+    _t_prewarm = time.time()
+    _dummy_x = torch.zeros(DEVICE_BATCH_SIZE, MAX_SEQ_LEN, dtype=torch.long, device=device)
+    _dummy_y = torch.zeros(DEVICE_BATCH_SIZE, MAX_SEQ_LEN, dtype=torch.long, device=device)
+    with autocast_ctx:
+        _d_loss, _d_aux = model(_dummy_x, _dummy_y)
+        (_d_loss + PC_WEIGHT * _d_aux).backward()
+    model.zero_grad(set_to_none=True)
+    del _dummy_x, _dummy_y, _d_loss, _d_aux
+    torch.cuda.synchronize()
+    print(f"  kernel pre-warm done in {time.time() - _t_prewarm:.0f}s", flush=True)
 
     # Flush memory fragmentation left by compile workers before training starts.
     torch.cuda.empty_cache()
