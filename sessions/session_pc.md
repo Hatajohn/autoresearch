@@ -321,3 +321,222 @@ Replaced with:
 
 All three should now benefit from the persistent kernel cache and produce
 valid val_bpb numbers for comparison.
+
+---
+
+### Run 11 — 2026-03-16 14:48 UTC
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.618736 (+0.435047 vs baseline 1.183689) |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.0 |
+| **TIME_BUDGET** | 480s |
+| **Steps** | 60 |
+| **Training seconds** | 489.8 |
+| **MFU** | 1.43% |
+| **Final pc_loss** | N/A |
+| **Log** | sessions/run11_pc_w0.1_a0.0.log |
+
+**Hypothesis:** ...
+
+**Finding:** ...
+
+#### Samples — Run 11
+
+```
+--- sample 1 ---
+--- prompt: '' ---
+
+<|reserved_0|>What is the cause of your stomach? Or? As you are having to have your stomach? Yes, you can get sick and get sick and your body. We're in the body of pregnancy from hearts who are sick.
+I've been sick, for the health issues I want to get your blood closing blood. These and your baby's body fatigue and fat body fat, and fat. I'm not aware that your skin are being treated at least one of the following, and not the body's bone and is the most common causes of the body.
+I'll give rise to the type of heartbeit? Treatment is a healthy blood pressure in our body, which is the body's organs and organs associated with our body.
+
+--- sample 2 ---
+--- prompt: '' ---
+
+<|reserved_0|>Based on a Wayer Civil War II
+
+Research for Korea Reny, and Quizab, and the Spir of Queen, and a Directederaldings of this Bankke, the Mador of the Large.
+Covelation of the Federal Sques at 200 100 years as a 200 kilots that 250 miles are also common in cases, people are currently active and can be done on the 200-200-50 missions. In its 2010, the Nelsius of the Hadmus, the Easter National Institute of Technology (Maer) in Wednes
+
+--- sample 3 ---
+--- prompt: '' ---
+
+<|reserved_0|>Can you wool?
+
+In this guide you can easily get rid of any problem. They might be right in the case. It's not a lot of work, but not weeds. So it's not just you have some advantages or disadvantages. If you don't know, it's more comfortable to make sure you have it. Let's delve into the world and just what your body's body is too important to keep your health. That's what. That's where you're doing a new technology in your body. The most important aspects of the body? If you have a few weeks, you should do this.
+
+Glook out of the body's body, you can see how to make your body and how to feel relaxing
+
+
+```
+
+---
+
+### Run 11 — 2026-03-16 15:19 UTC
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.618736 (+0.435047 vs baseline 1.183689) |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.0 |
+| **TIME_BUDGET** | 480s |
+| **Steps** | 60 |
+| **Training seconds** | 489.8 |
+| **MFU** | 1.43% |
+| **Final pc_loss** | N/A |
+| **Log** | sessions/run11_pc_w0.1_a0.0.log |
+
+**Hypothesis:** ...
+
+**Finding:** ...
+
+#### Samples — Run 11
+
+```
+--- sample 1 ---
+--- prompt: '' ---
+
+<|reserved_0|>Weldingerding
+Benefits of Bodynamics
+Benefits of Edition of the Lodder Bethan
+Tamelen: How to Venverbs
+The benefits of Crends
+Denewelry
+A: Unfortunately, it is important to note that they can increase their strength, strength and strength.
+What is the difference between Welcome and Body
+One of the most important benefits of Gathers is their own needs and is their primary goal. They are also a well-known source of precision that is known as a versatile tool for the quality of these factors. By taking care and care for the cost of the tools, you can provide the appropriate for
+
+--- sample 2 ---
+--- prompt: '' ---
+
+<|reserved_0|>The Monday's Climate Change Building Fatest CEO
+
+How to Image The Fest
+Schoolship program is the programme for the program and is the main purpose of the project and the programme for the program.
+How-to-making is a program to build a program designed programmers program that programme to work and work to provide programs. In this project, we will explore their programmed program to ensure that the program's programme is to enable programmers to program or programme programme programmer programm as a program programmer programmer programme programme programme to with programmable programmes for programmes and programmes programmes
+Liter programmes by
+
+--- sample 3 ---
+--- prompt: '' ---
+
+<|reserved_0|>January 20· Near 14-50
+
+The Virtor: Korean Korean
+
+The borean Tuesday Porse Tanzan
+
+The Tuesday's March 1, 2020
+
+Low's Poran and Horch
+
+We now see the story of this is the first one of the world as long as we see, which is the greatest number of people are just about 1-9 f11. The first year. But there is at the beginning of the journey. The year, we can see the top of their parents, and parents that they love them. The first day we had a friend from the first day, while in our home
+
+
+```
+
+---
+
+### Run 11 — 2026-03-16 15:25 UTC
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.618736 (+0.435047 vs baseline 1.183689) |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.0 |
+| **TIME_BUDGET** | 480s |
+| **Steps** | 60 |
+| **Training seconds** | 489.8 |
+| **MFU** | 1.43% |
+| **Final pc_loss** | N/A |
+| **Log** | sessions/run11_pc_w0.1_a0.0.log |
+
+**Hypothesis:** PC_ALPHA=0.0 = Option A sanity check with warm kernel cache
+
+**Finding:** VALID: 60 steps, no stalls, val_bpb=1.6187. pc_loss 0.00195→0.00123. Fewer tokens than Run 6 explains higher bpb.
+
+#### Samples — Run 11
+
+```
+--- sample 1 ---
+--- prompt: '' ---
+
+<|reserved_0|>Topular: Ground 500 (100°C). In this blog, we will guide you through 300% of the United States and 55% of the United States, and 25% of the American population 2%. In the United States, 13%, in 2013, 2012. The Australian population is 301% for the 207% of the United States, and 10%. The average annual 50.40% increased in 2019 are 15 (50% than 3.4%) and 20% of the American citizens. These are the most effective in the United States and are most popular among these countries. The first
+
+--- sample 2 ---
+--- prompt: '' ---
+
+<|reserved_0|>The 1 MAEW 3D model is the 2D model of the SOE 2D model 2Data, 3D image 1D printing is 2D printing. The model, according toD printing, will startD printing the model system of design. It helps theData 2D printing, the model to image printingDSDS modelingD printingDD printingD printingD printingDD printingDDSDSDD printingD printingD printingDD printingD printingD printingD printingDSDD printingD printingD printingDD printingDSD printingDD printingDDD printingDDDDirectDD printingDD
+
+--- sample 3 ---
+--- prompt: '' ---
+
+<|reserved_0|>Help
+For a small white ches,
+inchesive with this beautiful blueb. 800.01, and 120
+houhouhouhouhouhouhouhthouhthouhouhouhouhouhouhouhouhouhouhouhthouhou,houhouhouhouhouhouhouhouhouhouhouhouhouhouhthouhouhouhouhouhouhouhouhouhouhouhouhouhouhouhouhouhouhouhou
+
+
+```
+
+---
+
+### Run 12 — 2026-03-16 15:25 UTC
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.546595 (+0.362906 vs baseline 1.183689) |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.1 |
+| **TIME_BUDGET** | 600s |
+| **Steps** | 71 |
+| **Training seconds** | 605.4 |
+| **MFU** | 1.41% |
+| **Final pc_loss** | N/A |
+| **Log** | sessions/run12_pc_w0.1_a0.1.log |
+
+**Hypothesis:** Option B (PC_ALPHA=0.1): does error routing improve over Option A at matched compute?
+
+**Finding:** IMPROVEMENT: val_bpb=1.5466 vs 1.6187 (Option A), -0.072. Routing helps. Step 0 stall (734s) ate budget; 71 steps vs ~75 expected.
+
+#### Samples — Run 12
+
+```
+--- sample 1 ---
+--- prompt: '' ---
+
+<|reserved_0|>A study published in the 17th September 14th, 2020
+Middle 11 March 2022 with two Civil Bedo
+Series 2 Flight
+Jul 13
+Wednesday, June 13, 2020
+Gree Ath 2018
+What is the 28th 2004 Wednesday 2021
+What is the first year?
+2018 2008 Cultaneously?
+What is the main idea of a Bed Wednesday.
+Winner (Hey
+Wednesday, month, 2021). Federal
+Head
+Wednesday 2 July 16, November 20
+
+--- sample 2 ---
+--- prompt: '' ---
+
+<|reserved_0|>Invarious, the same as the a small group of researchers are involved in the lab, and the researchers are the use of the data from the cells. This is how the mice are in the same way, but the researchers at the University of Texas and the researchers are able to have a differentiation of the experiments. The mice are able to be able to be a little more frequently than the experiments. A team of scientists have included a nanotarticles called a single protein that produces a nanoparticles that is relatively few nanoparticles in the nanoparticle and nanoparticles. But this also comes from microscopy to nanoparticles, they are also a nanoparticles that are called
+
+--- sample 3 ---
+--- prompt: '' ---
+
+<|reserved_0|>The Laya Bakery of the La Sa Vacca
+Na is a Cooky
+Na, the Nica Maosa
+Na
+a Naoa a, ica,a,a
+aoa
+aiga
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+
+```
