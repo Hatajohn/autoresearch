@@ -44,7 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
-LOGFILE="sessions/run${RUN_NUM}_pc_w${PC_WEIGHT}_a${PC_ALPHA}.log"
+LOGFILE="sessions/run${RUN_NUM}_pc2_w${PC_WEIGHT}_a${PC_ALPHA}.log"
 SESSION_FILE="sessions/session_pc.md"
 
 if [ ! -f "$LOGFILE" ]; then
