@@ -7,6 +7,7 @@
 ## Data Flow
 
 ```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '13px'}}}%%
 flowchart TD
     TOK["tokens (B, T)"]
     WTE["wte · Embedding(vocab, 512)\nbfloat16"]
@@ -37,7 +38,7 @@ flowchart TD
                 VE_BOX{"Value Embed\n(layers 1,3,5,7)"}
                 VE["ve · Embedding(vocab, 512)\nve_gate Linear(32→4) sigmoid"]
                 ROPE["RoPE  +  QK-norm"]
-                TEMP["q  ×  (attn_temp² + 0.01)\nlearnable temperature"]
+                TEMP["q × (attn_temp² + 0.01)\nlearnable temperature"]
                 FA["Flash Attention 3\nor SDPA (causal, windowed)"]
                 CPROJ["c_proj  Linear(512→512)"]
                 QKV --> VE_BOX
@@ -58,7 +59,7 @@ flowchart TD
 
         subgraph PC["④–⑥ Predictive Coding"]
             direction TB
-            PH["PredHead(norm(x))\nfc Linear(512→512) + proj Linear(512→512)\nresidual  →  prediction"]
+            PH["PredHead(norm(x))\nfc Linear(512→512) + proj Linear(512→512)\nresidual → prediction"]
             ERR["raw_error = (target − pred) / pc_scale\npc_scale = √512 ≈ 22.6  (dimensionless)"]
             LOSS_PC["ELBO loss per token\nλ² · ‖error‖² − log(λ²)\nadd to pc_loss_map (B,T)"]
             GATE["routing_gate  Linear(512→1)\ngate = sigmoid(·) ∈ (0,1)"]
@@ -119,6 +120,37 @@ flowchart TD
     end
 
     SOFTCAP --> LOSS_BOX
+
+    %% ── colour classes ────────────────────────────────────────────────────
+    classDef inp    fill:#1e3a8a,stroke:#60a5fa,color:#e0f2fe,stroke-width:2px
+    classDef norm   fill:#312e81,stroke:#818cf8,color:#e0e7ff,stroke-width:1px
+    classDef scale  fill:#3b0764,stroke:#a855f7,color:#f3e8ff,stroke-width:1px
+    classDef summ   fill:#164e63,stroke:#22d3ee,color:#cffafe,stroke-width:2px
+    classDef attn   fill:#4c1d95,stroke:#a78bfa,color:#ede9fe,stroke-width:2px
+    classDef mlp    fill:#14532d,stroke:#4ade80,color:#dcfce7,stroke-width:2px
+    classDef pc     fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
+    classDef skip   fill:#0c4a6e,stroke:#38bdf8,color:#e0f2fe,stroke-width:1px
+    classDef stoch  fill:#881337,stroke:#fb7185,color:#ffe4e6,stroke-width:2px
+    classDef hist   fill:#1e293b,stroke:#475569,color:#cbd5e1,stroke-width:1px
+    classDef out    fill:#1e3a5f,stroke:#3b82f6,color:#dbeafe,stroke-width:2px
+    classDef loss   fill:#422006,stroke:#f97316,color:#ffedd5,stroke-width:2px
+    classDef total  fill:#713f12,stroke:#fbbf24,color:#fef9c3,stroke-width:3px
+    classDef dec    fill:#1f2937,stroke:#6b7280,color:#d1d5db,stroke-width:1px
+
+    class TOK,WTE         inp
+    class NORM0,OUT_NORM  norm
+    class RS              scale
+    class CONV,PROJ_S     summ
+    class QKV,VE,ROPE,TEMP,FA,CPROJ  attn
+    class FC,ACT,MP       mlp
+    class PH,ERR,LOSS_PC,GATE,CORR   pc
+    class S1,S2,S3,S4     skip
+    class MU,LS,SAMP,KL_OUT          stoch
+    class HIST            hist
+    class LM,SOFTCAP      out
+    class CE,MAIN,FOCAL,PC_L,AUX     loss
+    class TOTAL           total
+    class SUMM_SKIP,SL_SKIP,VE_BOX   dec
 ```
 
 ---
@@ -126,6 +158,7 @@ flowchart TD
 ## Attention Windows (PROGRESSIVE pattern, seq=2048)
 
 ```mermaid
+%%{init: {'theme': 'dark'}}%%
 xychart-beta
     title "Attention Window Size by Layer"
     x-axis ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"]
@@ -133,21 +166,47 @@ xychart-beta
     bar  [1024, 1024, 1024, 1024, 2048, 2048, 2048, 2048]
 ```
 
-Lower half of the network attends to 1 024 tokens (local). Upper half attends to the full 2 048-token context. Two levels instead of four cuts the number of unique FA3 kernels compiled, reducing cold-cache startup time.
+Lower half (L0–L3) attends to 1 024 tokens (local). Upper half (L4–L7) attends to the full 2 048-token context. Two levels instead of four cuts the number of unique FA3 kernels compiled, reducing cold-cache startup time.
 
 ---
 
 ## Skip-Layer PC Targets
 
 ```mermaid
+%%{init: {'theme': 'dark'}}%%
 flowchart LR
-    L0 & L1 -->|skip 1| H1["history[−1]"]
-    L2 & L3 -->|skip 2| H2["history[−2]"]
-    L4 & L5 -->|skip 3| H3["history[−3]"]
-    L6 & L7 -->|skip 4| H4["history[−4]"]
+    L0["L0"]
+    L1["L1"]
+    L2["L2"]
+    L3["L3"]
+    L4["L4"]
+    L5["L5"]
+    L6["L6"]
+    L7["L7"]
+    H1["history[−1]"]
+    H2["history[−2]"]
+    H3["history[−3]"]
+    H4["history[−4]"]
+
+    L0 & L1 -->|skip 1| H1
+    L2 & L3 -->|skip 2| H2
+    L4 & L5 -->|skip 3| H3
+    L6 & L7 -->|skip 4| H4
+
+    classDef shallow  fill:#1e3a8a,stroke:#60a5fa,color:#dbeafe,stroke-width:2px
+    classDef mid      fill:#065f46,stroke:#34d399,color:#d1fae5,stroke-width:2px
+    classDef deep     fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
+    classDef deepest  fill:#881337,stroke:#fb7185,color:#ffe4e6,stroke-width:2px
+    classDef hist     fill:#1e293b,stroke:#475569,color:#cbd5e1,stroke-width:2px
+
+    class L0,L1  shallow
+    class L2,L3  mid
+    class L4,L5  deep
+    class L6,L7  deepest
+    class H1,H2,H3,H4  hist
 ```
 
-Shallow layers predict only one step back (local refinement). Deep layers predict up to four steps back, creating long-range top-down signals that propagate PC error all the way from the output back to early representations.
+Shallow layers predict one step back (local refinement). Deep layers predict up to four steps back, propagating PC error signals from the output all the way to early representations.
 
 ---
 
