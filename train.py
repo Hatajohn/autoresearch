@@ -329,15 +329,19 @@ class GPT(nn.Module):
         x = norm(x)
         pc_loss = x.new_zeros(())   # 0-D scalar; torch.compile reuses this allocation
         prev_out = x.detach()       # block 0 predicts the initial embedding (generative PC)
+        # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
+        # tensor slice op rather than n_layer separate scalar-index ops, avoiding recompilation.
+        resid_scales = self.resid_lambdas.unbind(0)
+        pc_weights = self.pc_lambdas.square().unbind(0)
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x
+            x = resid_scales[i] * x
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
             # Generative PC: pred_head_i predicts the layer below from the current output (top-down)
             pred = block.pred_head(norm(x))
             pc_denom = prev_out.norm(dim=-1, keepdim=True) + 1e-6
             # Loss path: gradient flows through pred (updates pred_head); fused by compiler.
-            pc_contrib = self.pc_lambdas[i].square() * ((prev_out - pred) / pc_denom).pow(2).mean()
+            pc_contrib = pc_weights[i] * ((prev_out - pred) / pc_denom).pow(2).mean()
             pc_loss = pc_loss + pc_contrib
             # Option B: routing path uses fully-detached inputs so the correction tensor
             # carries no gradient and torch.compile can free it before the backward pass.
