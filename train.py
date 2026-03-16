@@ -219,6 +219,20 @@ class TemporalSummarizer(nn.Module):
         return x + h                       # residual: preserves original representation
 
 
+class _NoVE(nn.Module):
+    """Sentinel occupying non-VE slots in value_embeds ModuleList.
+    Returns None so CausalSelfAttention skips the value residual path."""
+    def forward(self, idx):
+        return None
+
+
+class _NoStoch(nn.Module):
+    """Sentinel occupying non-stochastic slots in stochastic_layers ModuleList.
+    Returns (x, 0) so the forward loop needs no conditional."""
+    def forward(self, x):
+        return x, x.new_zeros(())
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -249,21 +263,23 @@ class GPT(nn.Module):
         # Soft temporal compression: inserted at the two tier-transition layers
         # (n//3 and 2*n//3) to blend neighbouring token representations before
         # higher-level (wider-window) blocks process them.  T stays constant.
-        third = max(1, config.n_layer // 3)
-        self.summarizer_layers = {third, 2 * third}
-        self.summarizers = nn.ModuleDict({
-            str(i): TemporalSummarizer(config.n_embd)
-            for i in self.summarizer_layers
-        })
+        # nn.ModuleList with nn.Identity() at non-summarizer slots → forward loop
+        # uses plain integer indexing with no conditionals.
+        _summarizer_layers = {max(1, config.n_layer // 3), 2 * max(1, config.n_layer // 3)}
+        self.summarizers = nn.ModuleList([
+            TemporalSummarizer(config.n_embd) if i in _summarizer_layers else nn.Identity()
+            for i in range(config.n_layer)
+        ])
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        # Value embeddings
+        # Value embeddings — _NoVE sentinel at non-VE layers returns None, preserving the
+        # existing `if ve is not None` guard in CausalSelfAttention without any dict lookup.
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
+        self.value_embeds = nn.ModuleList([
+            nn.Embedding(config.vocab_size, kv_dim) if has_ve(i, config.n_layer) else _NoVE()
+            for i in range(config.n_layer)
+        ])
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -283,16 +299,13 @@ class GPT(nn.Module):
         self.register_buffer("pc_scale",
                              torch.tensor(config.n_embd ** 0.5, dtype=torch.bfloat16),
                              persistent=False)
-        # Stochastic layers at every 3rd block to add explicit uncertainty
-        stochastic_indices = set(range(2, config.n_layer, 3))  # 2, 5, 8, 11, ...
-        self.stochastic_layers = nn.ModuleDict({
-            str(i): StochasticLayer(config.n_embd)
-            for i in stochastic_indices
-        })
-        # Integer-indexed sets for O(1) membership checks in forward — avoids
-        # str(i) conversion on every iteration inside the compiled loop.
-        self.stochastic_layer_set = stochastic_indices
-        self.value_embed_set = {i for i in range(config.n_layer) if has_ve(i, config.n_layer)}
+        # Stochastic layers at every 3rd block — _NoStoch sentinel returns (x, zero_kl)
+        # so the forward loop always unpacks a 2-tuple with no conditional branch.
+        _stochastic_indices = set(range(2, config.n_layer, 3))  # 2, 5, 8, 11, ...
+        self.stochastic_layers = nn.ModuleList([
+            StochasticLayer(config.n_embd) if i in _stochastic_indices else _NoStoch()
+            for i in range(config.n_layer)
+        ])
         # Per-layer learnable precision scalars: weight each layer's PC error contribution.
         # Initialized to 1 (uniform), learned to up/down-weight layers during training.
         self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -322,33 +335,38 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.pc_lambdas.fill_(1.0)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        # Value embeddings (ModuleList contains nn.Embedding and _NoVE sentinels)
+        for ve in self.value_embeds:
+            if isinstance(ve, nn.Embedding):
+                torch.nn.init.uniform_(ve.weight, -s, s)
         # StochasticLayer: mu_proj = identity (no distortion), log_sigma_proj = -3 (tiny sigma)
-        for sl in self.stochastic_layers.values():
-            torch.nn.init.eye_(sl.mu_proj.weight)
-            torch.nn.init.constant_(sl.log_sigma_proj.weight, -3.0 / sl.log_sigma_proj.weight.size(0))
+        for sl in self.stochastic_layers:
+            if isinstance(sl, StochasticLayer):
+                torch.nn.init.eye_(sl.mu_proj.weight)
+                torch.nn.init.constant_(sl.log_sigma_proj.weight, -3.0 / sl.log_sigma_proj.weight.size(0))
         # TemporalSummarizer: zero-init proj so residual starts as identity
-        for summ in self.summarizers.values():
-            torch.nn.init.zeros_(summ.proj.weight)
-            torch.nn.init.ones_(summ.conv.weight)
+        for summ in self.summarizers:
+            if isinstance(summ, TemporalSummarizer):
+                torch.nn.init.zeros_(summ.proj.weight)
+                torch.nn.init.ones_(summ.conv.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        for ve in self.value_embeds:
+            if isinstance(ve, nn.Embedding):
+                ve.to(dtype=torch.bfloat16)
         # Scalar buffers are zeroed by meta-device → to_empty() construction — restore
         # to their intended initial values.  Normal (non-meta) instantiation doesn't need
         # this, but it is idempotent so safe to call unconditionally.
         self.pc_focal_gamma.fill_(PC_FOCAL_GAMMA)
         self.kl_weight.fill_(KL_WEIGHT)
         self.pc_scale.fill_(float(self.config.n_embd) ** 0.5)
-        for sl in self.stochastic_layers.values():
-            sl.noise_scale.fill_(1.0)   # start in training mode (1.0 = add noise)
+        for sl in self.stochastic_layers:
+            if isinstance(sl, StochasticLayer):
+                sl.noise_scale.fill_(1.0)   # start in training mode (1.0 = add noise)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -508,13 +526,11 @@ class GPT(nn.Module):
         layer_outs = []
         for i, block in enumerate(self.transformer.h):
             x = resid_scales[i] * x
-            if i in self.summarizer_layers:
-                x = self.summarizers[str(i)](x)
-            ve = self.value_embeds[str(i)](idx) if i in self.value_embed_set else None
+            x = self.summarizers[i](x)                    # Identity at non-summarizer layers
+            ve = self.value_embeds[i](idx)                # _NoVE returns None at non-VE layers
             x = block(x, ve, cos_sin, self.window_sizes[i])
-            if i in self.stochastic_layer_set:
-                x, kl_contrib = self.stochastic_layers[str(i)](x)
-                kl_loss = kl_loss + kl_contrib
+            x, kl_contrib = self.stochastic_layers[i](x)  # _NoStoch returns (x, 0) at non-stoch layers
+            kl_loss = kl_loss + kl_contrib
             layer_outs.append(x)
 
         # ── Phase 2: broadcast predictive coding ────────────────────────────
@@ -906,6 +922,11 @@ if __name__ == "__main__":
             if group['kind'] == 'muon':
                 group["momentum"] = muon_momentum
                 group["weight_decay"] = muon_weight_decay
+        # Clip gradients before the optimizer step.  Muon's NorMuon normalisation
+        # already bounds backbone matrix steps; this catches runaway gradients on the
+        # AdamW-trained params (pred_head, routing_gate, summarizers, stochastic layers).
+        all_params = [p for g in optimizer.param_groups for p in g['params']]
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
@@ -953,9 +974,10 @@ if __name__ == "__main__":
 
     total_tokens = step * TOTAL_BATCH_SIZE
 
-    # Final eval
+    # Final eval — torch.no_grad() prevents building a computation graph during
+    # validation, saving ~30% of forward-pass time and freeing activation memory.
     model.eval()
-    with autocast_ctx:
+    with autocast_ctx, torch.no_grad():
         val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
     # Final summary
