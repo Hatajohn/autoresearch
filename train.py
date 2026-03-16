@@ -154,6 +154,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
         self.pred_head = PredHead(config.n_embd)
+        # Per-token precision gate: learns which token positions should receive
+        # top-down PC correction.  Initialized to zero → sigmoid(0)=0.5 (neutral).
+        self.routing_gate = nn.Linear(config.n_embd, 1, bias=False)
 
     def forward(self, x, ve, cos_sin, window_size):
         out = x + self.attn(norm(x), ve, cos_sin, window_size)
@@ -225,9 +228,11 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # PredHead: fc uniform (learns features), proj zero (no-op at step 0)
+        # routing_gate: zero init → sigmoid(0)=0.5, neutral correction at step 0
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
             torch.nn.init.zeros_(block.pred_head.proj.weight)
+            torch.nn.init.zeros_(block.routing_gate.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -307,7 +312,8 @@ class GPT(nn.Module):
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         pred_head_params = [p for block in self.transformer.h
-                            for p in block.pred_head.parameters()]
+                            for p in list(block.pred_head.parameters())
+                                     + list(block.routing_gate.parameters())]
         pred_head_param_ids = {id(p) for p in pred_head_params}
         matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in pred_head_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
@@ -368,8 +374,10 @@ class GPT(nn.Module):
             # Loss path: gradient flows through pred (updates pred_head); fused by compiler.
             pc_contrib = pc_weights[i] * ((target_out - pred) / pc_denom).pow(2).mean()
             pc_loss = pc_loss + pc_contrib
-            # Routing path: fully-detached correction so CE backprop is unaffected.
-            x = x + self.pc_alpha * ((target_out - pred.detach()) / pc_denom)
+            # Routing path: per-token precision gate scales correction per position.
+            # gate ∈ (0,1); sigmoid(0)=0.5 initially → neutral, learns where to correct.
+            gate = torch.sigmoid(block.routing_gate(norm(x)))   # (B, T, 1)
+            x = x + gate * self.pc_alpha * ((target_out - pred.detach()) / pc_denom)
             history = history[1:] + [x.detach()]  # rotate: drop oldest, append current
         pc_loss = pc_loss / len(self.transformer.h)
         x = norm(x)
