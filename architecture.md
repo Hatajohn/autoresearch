@@ -7,40 +7,40 @@
 ## Data Flow
 
 ```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '13px'}}}%%
+%%{init: {"theme": "dark"}}%%
 flowchart TD
     TOK["tokens (B, T)"]
-    WTE["wte · Embedding(vocab, 512)\nbfloat16"]
+    WTE["wte - Embedding(vocab, 512) bfloat16"]
     NORM0["RMSNorm"]
     TOK --> WTE --> NORM0
 
     NORM0 --> LOOP
 
-    subgraph LOOP["Layer loop  i = 0 … 7"]
+    subgraph LOOP["Layer loop  i = 0 to 7"]
         direction TB
 
-        RS["① resid_lambdas[i] · x\nlearnable per-layer scale"]
+        RS["1. resid_lambdas[i] * x  per-layer scale"]
 
-        subgraph SUMM_BOX["② TemporalSummarizer  (layers 2, 4 only)"]
+        subgraph SUMM_BOX["2. TemporalSummarizer  (layers 2, 4 only)"]
             direction LR
-            CONV["depthwise Conv1d\nkernel=4, causal"]
-            PROJ_S["Linear(512→512)"]
+            CONV["depthwise Conv1d  kernel=4, causal"]
+            PROJ_S["Linear(512->512)"]
             CONV --> PROJ_S
         end
         SUMM_SKIP{"layer 2 or 4?"}
 
-        subgraph BLOCK["③ Block  (pre-norm)"]
+        subgraph BLOCK["3. Block  (pre-norm)"]
             direction TB
 
             subgraph ATT["CausalSelfAttention"]
                 direction TB
-                QKV["c_q / c_k / c_v  Linear(512→512)"]
-                VE_BOX{"Value Embed\n(layers 1,3,5,7)"}
-                VE["ve · Embedding(vocab, 512)\nve_gate Linear(32→4) sigmoid"]
-                ROPE["RoPE  +  QK-norm"]
-                TEMP["q × (attn_temp² + 0.01)\nlearnable temperature"]
+                QKV["c_q / c_k / c_v  Linear(512->512)"]
+                VE_BOX{"Value Embed layers 1,3,5,7"}
+                VE["ve Embedding(vocab, 512)\nve_gate Linear(32->4) sigmoid"]
+                ROPE["RoPE + QK-norm"]
+                TEMP["q x (attn_temp^2 + 0.01)\nlearnable temperature"]
                 FA["Flash Attention 3\nor SDPA (causal, windowed)"]
-                CPROJ["c_proj  Linear(512→512)"]
+                CPROJ["c_proj  Linear(512->512)"]
                 QKV --> VE_BOX
                 VE_BOX -- yes --> VE --> ROPE
                 VE_BOX -- no --> ROPE
@@ -48,46 +48,46 @@ flowchart TD
             end
 
             subgraph MLP_BOX["MLP"]
-                FC["c_fc  Linear(512→2048)"]
-                ACT["ReLU²"]
-                MP["c_proj  Linear(2048→512)"]
+                FC["c_fc  Linear(512->2048)"]
+                ACT["ReLU^2"]
+                MP["c_proj  Linear(2048->512)"]
                 FC --> ACT --> MP
             end
 
             ATT --> MLP_BOX
         end
 
-        subgraph PC["④–⑥ Predictive Coding"]
+        subgraph PC["4-6. Predictive Coding"]
             direction TB
-            PH["PredHead(norm(x))\nfc Linear(512→512) + proj Linear(512→512)\nresidual → prediction"]
-            ERR["raw_error = (target − pred) / pc_scale\npc_scale = √512 ≈ 22.6  (dimensionless)"]
-            LOSS_PC["ELBO loss per token\nλ² · ‖error‖² − log(λ²)\nadd to pc_loss_map (B,T)"]
-            GATE["routing_gate  Linear(512→1)\ngate = sigmoid(·) ∈ (0,1)"]
-            CORR["x += gate · pc_alpha · λ² · error\n(top-down correction)"]
+            PH["PredHead(norm(x))\nfc + proj  residual -> prediction"]
+            ERR["raw_error = (target - pred) / pc_scale\npc_scale = sqrt(512) ~= 22.6"]
+            LOSS_PC["ELBO per token\nL^2 * ||error||^2 - log(L^2)\nadd to pc_loss_map (B,T)"]
+            GATE["routing_gate  Linear(512->1)\ngate = sigmoid in (0,1)"]
+            CORR["x += gate * pc_alpha * L^2 * error\ntop-down correction"]
             PH --> ERR --> LOSS_PC
             ERR --> GATE --> CORR
         end
 
-        subgraph SKIP_PC["Skip-layer target  (history buffer depth 5)"]
+        subgraph SKIP_PC["Skip-layer targets  (history depth 5)"]
             direction LR
-            S1["layers 0–1: skip 1"]
-            S2["layers 2–3: skip 2"]
-            S3["layers 4–5: skip 3"]
-            S4["layers 6–7: skip 4"]
+            S1["layers 0-1: skip 1"]
+            S2["layers 2-3: skip 2"]
+            S3["layers 4-5: skip 3"]
+            S4["layers 6-7: skip 4"]
         end
 
-        subgraph SL_BOX["⑦ StochasticLayer  (layers 2, 5 only)"]
+        subgraph SL_BOX["7. StochasticLayer  (layers 2, 5 only)"]
             direction LR
-            MU["mu_proj  Linear(512→512)"]
-            LS["log_sigma_proj  Linear(512→512)\nclamped to [−6, 2]"]
-            SAMP["z = mu + noise_scale · σ · ε\nnoise_scale=1 train / 0 eval"]
-            KL_OUT["KL(q ∥ N(0,1)) → kl_loss"]
+            MU["mu_proj  Linear(512->512)"]
+            LS["log_sigma_proj  Linear(512->512)\nclamped to [-6, 2]"]
+            SAMP["z = mu + noise_scale * sigma * eps\nnoise=1 train / 0 eval"]
+            KL_OUT["KL(q || N(0,1)) -> kl_loss"]
             MU --> SAMP
             LS --> SAMP --> KL_OUT
         end
         SL_SKIP{"layer 2 or 5?"}
 
-        HIST["⑧ history.rotate()\ndrop oldest, append x.detach()"]
+        HIST["8. history.rotate()\ndrop oldest, append x.detach()"]
 
         RS --> SUMM_SKIP
         SUMM_SKIP -- yes --> SUMM_BOX --> BLOCK
@@ -102,18 +102,18 @@ flowchart TD
     HIST --> OUT_NORM
 
     OUT_NORM["RMSNorm"]
-    LM["lm_head  Linear(512→vocab)  no bias"]
-    SOFTCAP["softcap: 15·tanh(logits/15)"]
+    LM["lm_head  Linear(512->vocab)  no bias"]
+    SOFTCAP["softcap: 15 * tanh(logits / 15)"]
     OUT_NORM --> LM --> SOFTCAP
 
     subgraph LOSS_BOX["Loss (training)"]
         direction TB
         CE["token_ce = CE(logits, targets)  per token (B,T)"]
-        MAIN["main_loss = mean(token_ce)\n+ 0.15·CE(t+2)  + 0.05·CE(t+4)\nmulti-timescale auxiliary"]
-        FOCAL["difficulty = (token_ce / mean)^pc_focal_gamma\nfocal weight — hard tokens get more PC signal"]
-        PC_L["pc_loss = mean(pc_loss_map · difficulty) / n_layer"]
-        AUX["aux_loss = pc_loss  +  kl_weight · kl_loss"]
-        TOTAL["total = main_loss  +  PC_WEIGHT · aux_loss"]
+        MAIN["main_loss = mean(token_ce)\n+ 0.15*CE(t+2) + 0.05*CE(t+4)\nmulti-timescale auxiliary"]
+        FOCAL["difficulty = (token_ce / mean)^gamma\nfocal weight - hard tokens get more PC signal"]
+        PC_L["pc_loss = mean(pc_loss_map * difficulty) / n_layer"]
+        AUX["aux_loss = pc_loss + kl_weight * kl_loss"]
+        TOTAL["total = main_loss + PC_WEIGHT * aux_loss"]
         CE --> MAIN
         CE --> FOCAL --> PC_L --> AUX --> TOTAL
         MAIN --> TOTAL
@@ -121,7 +121,7 @@ flowchart TD
 
     SOFTCAP --> LOSS_BOX
 
-    %% ── colour classes ────────────────────────────────────────────────────
+    %% colour classes
     classDef inp    fill:#1e3a8a,stroke:#60a5fa,color:#e0f2fe,stroke-width:2px
     classDef norm   fill:#312e81,stroke:#818cf8,color:#e0e7ff,stroke-width:1px
     classDef scale  fill:#3b0764,stroke:#a855f7,color:#f3e8ff,stroke-width:1px
