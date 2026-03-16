@@ -155,6 +155,34 @@ class PredHead(nn.Module):
         return x + self.proj(F.tanh(self.fc(x)))
 
 
+class StochasticLayer(nn.Module):
+    """Reparameterized sampling layer: makes layer uncertainty explicit.
+
+    Each designated block outputs a posterior distribution q(z|x) = N(mu, sigma²)
+    rather than a deterministic point. During training, z is sampled via the
+    reparameterization trick; at eval, z = mu (no noise).
+
+    KL divergence against N(0,1) is returned as a separate loss term, encouraging
+    the model to maintain calibrated uncertainty estimates.
+    """
+    def __init__(self, n_embd):
+        super().__init__()
+        self.mu_proj       = nn.Linear(n_embd, n_embd, bias=False)
+        self.log_sigma_proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def forward(self, x):
+        mu        = self.mu_proj(x)
+        log_sigma = self.log_sigma_proj(x).clamp(-6.0, 2.0)
+        sigma     = log_sigma.exp()
+        if self.training:
+            z = mu + sigma * torch.randn_like(mu)
+        else:
+            z = mu
+        # KL(q || N(0,1)) = 0.5 * (sigma² + mu² - log(sigma²) - 1)
+        kl = 0.5 * (sigma.pow(2) + mu.pow(2) - 2.0 * log_sigma - 1.0).mean()
+        return z, kl
+
+
 class TemporalSummarizer(nn.Module):
     """Soft temporal compression: mixes neighbouring token representations via a
     depthwise (channel-wise) causal convolution, then projects back.
@@ -238,6 +266,15 @@ class GPT(nn.Module):
         # Stored as buffer (not literal) so sweeping PC_FOCAL_GAMMA never triggers recompile.
         self.register_buffer("pc_focal_gamma", torch.tensor(PC_FOCAL_GAMMA, dtype=torch.bfloat16),
                              persistent=False)
+        # KL weight for stochastic layers.  Buffer → sweepable without recompile.
+        self.register_buffer("kl_weight", torch.tensor(KL_WEIGHT, dtype=torch.bfloat16),
+                             persistent=False)
+        # Stochastic layers at every 3rd block to add explicit uncertainty
+        stochastic_indices = set(range(2, config.n_layer, 3))  # 2, 5, 8, 11, ...
+        self.stochastic_layers = nn.ModuleDict({
+            str(i): StochasticLayer(config.n_embd)
+            for i in stochastic_indices
+        })
         # Per-layer learnable precision scalars: weight each layer's PC error contribution.
         # Initialized to 1 (uniform), learned to up/down-weight layers during training.
         self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -273,6 +310,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # StochasticLayer: mu_proj = identity (no distortion), log_sigma_proj = -3 (tiny sigma)
+        for sl in self.stochastic_layers.values():
+            torch.nn.init.eye_(sl.mu_proj.weight)
+            torch.nn.init.constant_(sl.log_sigma_proj.weight, -3.0 / sl.log_sigma_proj.weight.size(0))
         # TemporalSummarizer: zero-init proj so residual starts as identity
         for summ in self.summarizers.values():
             torch.nn.init.zeros_(summ.proj.weight)
@@ -377,10 +418,11 @@ class GPT(nn.Module):
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         summarizer_params = list(self.summarizers.parameters())
+        stochastic_params = list(self.stochastic_layers.parameters())
         resid_params = [self.resid_lambdas, self.pc_lambdas] + attn_temp_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
-            len(pred_head_params) + len(summarizer_params))
+            len(pred_head_params) + len(summarizer_params) + len(stochastic_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -393,6 +435,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=pred_head_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # summarizer matrices use AdamW (small, non-square conv/proj weights)
             dict(kind='adamw', params=summarizer_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            # stochastic layer matrices (mu_proj, log_sigma_proj) use AdamW
+            dict(kind='adamw', params=stochastic_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -413,6 +457,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         pc_loss_map = x.new_zeros(B, T)  # (B, T) per-token accumulator; reduced after logits
+        kl_loss = x.new_zeros(())        # scalar KL accumulated across stochastic layers
         # History buffer for skip-layer PC: history[-1] is most recent, history[-k] is k steps back.
         # Pre-fill all slots with the initial embedding so every layer has a valid target
         # regardless of skip distance.  Static length = max_skip + 1 → compile-safe.
@@ -441,6 +486,10 @@ class GPT(nn.Module):
             # gate ∈ (0,1); sigmoid(0)=0.5 initially → neutral, learns where to correct.
             gate = torch.sigmoid(block.routing_gate(norm(x)))   # (B, T, 1)
             x = x + gate * self.pc_alpha * ((target_out - pred.detach()) / pc_denom)
+            # Stochastic reparameterization at designated layers
+            if str(i) in self.stochastic_layers:
+                x, kl_contrib = self.stochastic_layers[str(i)](x)
+                kl_loss = kl_loss + kl_contrib
             history = history[1:] + [x.detach()]  # rotate: drop oldest, append current
         x = norm(x)
 
@@ -471,7 +520,7 @@ class GPT(nn.Module):
             ).view(B, T).detach()
             difficulty = (token_loss / (token_loss.mean() + 1e-6)).pow(self.pc_focal_gamma)
             pc_loss = (pc_loss_map * difficulty).mean() / len(self.transformer.h)
-            return loss, pc_loss
+            return loss, pc_loss, kl_loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -634,6 +683,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 PC_WEIGHT       = float(os.environ.get("PC_WEIGHT",       "0.1"))
 PC_ALPHA        = float(os.environ.get("PC_ALPHA",        "0.1"))  # 0.0 = Option A (no routing)
 PC_FOCAL_GAMMA  = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
+KL_WEIGHT       = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -761,8 +811,8 @@ if __name__ == "__main__":
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
-                main_loss, pc_loss = model(x, y)
-                loss = main_loss + PC_WEIGHT * pc_loss
+                main_loss, pc_loss, kl_loss = model(x, y)
+                loss = main_loss + PC_WEIGHT * pc_loss + model.kl_weight * kl_loss
             train_loss = main_loss.detach()
             train_pc_loss = pc_loss.detach()
             loss = loss / grad_accum_steps
