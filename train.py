@@ -155,6 +155,32 @@ class PredHead(nn.Module):
         return x + self.proj(F.tanh(self.fc(x)))
 
 
+class TemporalSummarizer(nn.Module):
+    """Soft temporal compression: mixes neighbouring token representations via a
+    depthwise (channel-wise) causal convolution, then projects back.
+
+    Keeps sequence length T constant so torch.compile fullgraph=True is preserved.
+    The effect is that higher layers 'see' a blended version of local neighbourhoods,
+    approximating the coarser-timescale summaries of a DTM without changing shapes.
+    """
+    def __init__(self, n_embd, stride=4):
+        super().__init__()
+        self.stride = stride
+        # Depthwise conv: kernel_size=stride, causal padding on left only
+        self.conv = nn.Conv1d(n_embd, n_embd, kernel_size=stride,
+                              padding=stride - 1, groups=n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def forward(self, x):
+        # x: (B, T, C)  →  transpose for Conv1d  →  (B, C, T)
+        B, T, C = x.size()
+        h = x.transpose(1, 2)              # (B, C, T)
+        h = self.conv(h)[..., :T]          # causal: keep first T outputs, drop padding
+        h = h.transpose(1, 2)              # (B, T, C)
+        h = self.proj(h)
+        return x + h                       # residual: preserves original representation
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -179,6 +205,15 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+        })
+        # Soft temporal compression: inserted at the two tier-transition layers
+        # (n//3 and 2*n//3) to blend neighbouring token representations before
+        # higher-level (wider-window) blocks process them.  T stays constant.
+        third = max(1, config.n_layer // 3)
+        self.summarizer_layers = {third, 2 * third}
+        self.summarizers = nn.ModuleDict({
+            str(i): TemporalSummarizer(config.n_embd)
+            for i in self.summarizer_layers
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -238,6 +273,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # TemporalSummarizer: zero-init proj so residual starts as identity
+        for summ in self.summarizers.values():
+            torch.nn.init.zeros_(summ.proj.weight)
+            torch.nn.init.ones_(summ.conv.weight)   # identity-like average at start
         # PredHead: fc uniform (learns features), proj zero (no-op at step 0)
         # routing_gate: zero init → sigmoid(0)=0.5, neutral correction at step 0
         # attn_temp: ones init → scale = 1² + 0.01 ≈ 1.01, near-neutral precision
@@ -337,10 +376,11 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        summarizer_params = list(self.summarizers.parameters())
         resid_params = [self.resid_lambdas, self.pc_lambdas] + attn_temp_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
-            len(pred_head_params))
+            len(pred_head_params) + len(summarizer_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -351,6 +391,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # pred_head in AdamW: kept out of Muon to avoid polluting backbone gradient groups
             dict(kind='adamw', params=pred_head_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            # summarizer matrices use AdamW (small, non-square conv/proj weights)
+            dict(kind='adamw', params=summarizer_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -381,6 +423,9 @@ class GPT(nn.Module):
         pc_weights = self.pc_lambdas.square().unbind(0)
         for i, block in enumerate(self.transformer.h):
             x = resid_scales[i] * x
+            # Soft temporal compression at tier-transition layers (before the block)
+            if str(i) in self.summarizers:
+                x = self.summarizers[str(i)](x)
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
             # Skip-layer PC: shallow layers predict 1 step back (adjacent), deep layers
