@@ -90,6 +90,10 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Learnable attention temperature (precision scalar): scales softmax sharpness.
+        # β = attn_temp² + ε corresponds to inverse temperature in PC precision.
+        # Initialized to 1 so scale ≈ 1/sqrt(head_dim) * 1 (neutral at step 0).
+        self.attn_temp = nn.Parameter(torch.ones(1))
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -106,6 +110,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        # Apply learnable temperature: higher β → sharper attention (higher precision).
+        # q*β shifts the softmax scale; ε=0.01 keeps gradient smooth near zero.
+        q = q * (self.attn_temp.square() + 0.01)
 
         if fa3 is not None:
             y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -233,10 +240,12 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # PredHead: fc uniform (learns features), proj zero (no-op at step 0)
         # routing_gate: zero init → sigmoid(0)=0.5, neutral correction at step 0
+        # attn_temp: ones init → scale = 1² + 0.01 ≈ 1.01, near-neutral precision
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
             torch.nn.init.zeros_(block.pred_head.proj.weight)
             torch.nn.init.zeros_(block.routing_gate.weight)
+            torch.nn.init.ones_(block.attn.attn_temp)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -319,11 +328,16 @@ class GPT(nn.Module):
                             for p in list(block.pred_head.parameters())
                                      + list(block.routing_gate.parameters())]
         pred_head_param_ids = {id(p) for p in pred_head_params}
-        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in pred_head_param_ids]
+        # attn_temp is a per-layer scalar — route to resid_params (high scalar LR)
+        # rather than matrix_params (Muon optimizer, wrong for scalars).
+        attn_temp_params = [block.attn.attn_temp for block in self.transformer.h]
+        attn_temp_param_ids = {id(p) for p in attn_temp_params}
+        exclude_ids = pred_head_param_ids | attn_temp_param_ids
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in exclude_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas, self.pc_lambdas]
+        resid_params = [self.resid_lambdas, self.pc_lambdas] + attn_temp_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
             len(pred_head_params))
