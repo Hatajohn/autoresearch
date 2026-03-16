@@ -8,3 +8,4 @@ HEAD	1.969646	15.9	invalid	Run 9 (PC_ALPHA=0.1): cold inductor cache caused 4 st
 HEAD	N/A	15.9	incomplete	Run 10 (PC_ALPHA=0.05): killed before final eval; 20 steps, loss 9.01→5.77, pc_loss decreasing — warm cache, but no val_bpb
 HEAD	1.618736	15.9	keep	Run 11 (PC_ALPHA=0.0 = Option A): 60 steps/31.5M tok, no stalls, warm cache confirmed working
 HEAD	1.546595	15.9	keep	Run 12 (PC_ALPHA=0.1 = Option B): 71 steps/37.2M tok, -0.072 vs Run 11 — routing improves convergence at matched compute
+HEAD	1.857829	15.9	invalid	Run 13 pc2 (PC_ALPHA=0.1): cold kernel cache from pc2 arch changes (residual PredHead+pc_lambdas); 28 steps/~1700s stalls — unbind() fix now applied

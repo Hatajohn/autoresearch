@@ -540,3 +540,44 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 
 ```
+
+---
+
+## Session 4 — 2026-03-16 PC2 Architecture Notes
+
+### PC2 Changes (commits a5b32dc + 8b3462f)
+
+Two changes introduced by a parallel agent, reviewed and smoke-tested:
+
+**1. Residual PredHead** (`a5b32dc`)
+`PredHead.forward` changed from `proj(tanh(fc(x)))` to `x + proj(tanh(fc(x)))`.
+Biases predictions toward the identity at init (proj is zero-initialized), learning
+corrections rather than full predictions. More stable early training.
+
+**2. Per-layer precision scalars `pc_lambdas`** (`a5b32dc`)
+`nn.Parameter(torch.ones(n_layer))` — one learnable scalar per layer weighting its
+PC error contribution. Applied as `pc_lambdas[i].square()` (always positive).
+Lets the model learn which layers benefit most from predictive coding.
+
+**3. `unbind()` recompilation fix** (`8b3462f`)
+`self.pc_lambdas[i]` inside the loop caused `n_layer` separate scalar-index ops,
+each triggering a new Triton kernel. Pre-computing `pc_lambdas.square().unbind(0)`
+before the loop gives the compiler a single stable op. Same fix applied to
+`resid_lambdas`. Confirmed: second forward pass 8ms, no recompile.
+
+---
+
+### Run 13 pc2 — PC_ALPHA=0.1, PC_WEIGHT=0.1, TIME=600s (INVALID)
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.857829 (not comparable — cold cache) |
+| **Steps** | 28 |
+| **Training seconds** | 1008s |
+| **Total seconds** | 2346s |
+| **MFU** | 0.25% |
+| **Log** | sessions/run13_pc2_w0.1_a0.1.log |
+
+**Status: INVALID** — cold kernel cache from new pc2 graph variants.
+Steps 6-8 stalled 157/159/330s, step 27 stalled 639s. `unbind()` fix was not yet
+applied when this run started. Run 14 will be the first valid pc2 result.
