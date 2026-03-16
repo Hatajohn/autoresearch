@@ -269,6 +269,13 @@ class GPT(nn.Module):
         # KL weight for stochastic layers.  Buffer → sweepable without recompile.
         self.register_buffer("kl_weight", torch.tensor(KL_WEIGHT, dtype=torch.bfloat16),
                              persistent=False)
+        # Fixed normalisation for raw prediction errors (Bogacz 2017, Eq 10-11).
+        # Dividing by sqrt(n_embd) makes errors dimensionless regardless of embedding scale.
+        # The learned pc_lambdas² then represent precision = 1/Σ over these scaled errors,
+        # rather than fighting the L2 norm of representations (previous pc_denom).
+        self.register_buffer("pc_scale",
+                             torch.tensor(config.n_embd ** 0.5, dtype=torch.bfloat16),
+                             persistent=False)
         # Stochastic layers at every 3rd block to add explicit uncertainty
         stochastic_indices = set(range(2, config.n_layer, 3))  # 2, 5, 8, 11, ...
         self.stochastic_layers = nn.ModuleDict({
@@ -465,7 +472,10 @@ class GPT(nn.Module):
         # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
         # tensor slice op rather than n_layer separate scalar-index ops, avoiding recompilation.
         resid_scales = self.resid_lambdas.unbind(0)
-        pc_weights = self.pc_lambdas.square().unbind(0)
+        lambda_sq = self.pc_lambdas.square()
+        pc_weights          = lambda_sq.unbind(0)          # λᵢ² — precision, used in loss
+        pc_log_weights      = lambda_sq.clamp(min=1e-8).log().unbind(0)  # log(λᵢ²) — ELBO term
+        pc_precision_routing = lambda_sq.detach().unbind(0)               # λᵢ² detached — routing
         for i, block in enumerate(self.transformer.h):
             x = resid_scales[i] * x
             # Soft temporal compression at tier-transition layers (before the block)
@@ -478,14 +488,18 @@ class GPT(nn.Module):
             skip = self.skip_schedule[i]   # static Python int at compile time
             target_out = history[-skip]    # static negative index; no dynamic dispatch
             pred = block.pred_head(norm(x))
-            pc_denom = target_out.norm(dim=-1, keepdim=True) + 1e-6
-            # Loss path: accumulate per-token (mean over embed dim); reduced after logits.
-            pc_contrib = pc_weights[i] * ((target_out - pred) / pc_denom).pow(2).mean(dim=-1)
+            # Bogacz (2017) Eq 10-11: errors are normalised by Σ (variance), not ||target||.
+            # We use pc_scale = sqrt(n_embd) as a fixed dim-normaliser; λ² = 1/Σ is learned.
+            raw_error = (target_out - pred) / self.pc_scale    # (B, T, C), dimensionless
+            # Loss path: ELBO = λ² * error² - log(λ²)
+            # Without -log(λ²), λ grows unbounded; with it, λ² → 1/E[error²] at equilibrium.
+            pc_contrib = (pc_weights[i] * raw_error.pow(2).mean(dim=-1)
+                          - pc_log_weights[i])                 # (B, T)
             pc_loss_map = pc_loss_map + pc_contrib
-            # Routing path: per-token precision gate scales correction per position.
+            # Routing path: precision-weighted correction — λ² · error (Bogacz Eq 53).
             # gate ∈ (0,1); sigmoid(0)=0.5 initially → neutral, learns where to correct.
             gate = torch.sigmoid(block.routing_gate(norm(x)))   # (B, T, 1)
-            x = x + gate * self.pc_alpha * ((target_out - pred.detach()) / pc_denom)
+            x = x + gate * self.pc_alpha * pc_precision_routing[i] * (target_out - pred.detach()) / self.pc_scale
             # Stochastic reparameterization at designated layers
             if str(i) in self.stochastic_layers:
                 x, kl_contrib = self.stochastic_layers[str(i)](x)
