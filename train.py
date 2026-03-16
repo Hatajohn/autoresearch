@@ -145,7 +145,7 @@ class PredHead(nn.Module):
         self.proj = nn.Linear(n_embd, n_embd, bias=False)
 
     def forward(self, x):
-        return self.proj(F.tanh(self.fc(x)))
+        return x + self.proj(F.tanh(self.fc(x)))
 
 
 class Block(nn.Module):
@@ -189,6 +189,9 @@ class GPT(nn.Module):
         # experiments never invalidates the compiled graph.
         self.register_buffer("pc_alpha", torch.tensor(PC_ALPHA, dtype=torch.bfloat16),
                              persistent=False)
+        # Per-layer learnable precision scalars: weight each layer's PC error contribution.
+        # Initialized to 1 (uniform), learned to up/down-weight layers during training.
+        self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
 
     @torch.no_grad()
     def init_weights(self):
@@ -207,6 +210,7 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
+        self.pc_lambdas.fill_(1.0)
         # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
@@ -273,7 +277,7 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel()
+        scalars = self.resid_lambdas.numel() + self.pc_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
@@ -290,7 +294,7 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
+        resid_params = [self.resid_lambdas, self.pc_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
             len(pred_head_params))
@@ -333,7 +337,7 @@ class GPT(nn.Module):
             pred = block.pred_head(norm(x))
             pc_denom = prev_out.norm(dim=-1, keepdim=True) + 1e-6
             # Loss path: gradient flows through pred (updates pred_head); fused by compiler.
-            pc_contrib = ((prev_out - pred) / pc_denom).pow(2).mean()
+            pc_contrib = self.pc_lambdas[i].square() * ((prev_out - pred) / pc_denom).pow(2).mean()
             pc_loss = pc_loss + pc_contrib
             # Option B: routing path uses fully-detached inputs so the correction tensor
             # carries no gradient and torch.compile can free it before the backward pass.
