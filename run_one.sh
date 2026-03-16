@@ -23,6 +23,7 @@ set -euo pipefail
 if [ $# -ne 4 ]; then
     echo "Usage: bash run_one.sh <run_num> <pc_weight> <pc_alpha> <time_budget_secs>" >&2
     echo "Example: bash run_one.sh 11 0.1 0.0 480" >&2
+    echo "Optional env overrides: PC_FOCAL_GAMMA=1.0 KL_WEIGHT=0.01" >&2
     exit 1
 fi
 
@@ -30,6 +31,10 @@ RUN_NUM="$1"
 PC_WEIGHT="$2"
 PC_ALPHA="$3"
 TIME_BUDGET="$4"
+# Optional env-var overrides for new sweepable hyperparameters.
+# Defaults match train.py so existing callers don't need to change.
+PC_FOCAL_GAMMA="${PC_FOCAL_GAMMA:-1.0}"
+KL_WEIGHT="${KL_WEIGHT:-0.01}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -72,6 +77,8 @@ echo "[run_one] Starting at $(date -u '+%Y-%m-%d %H:%M UTC')..."
 TRAIN_TIME_BUDGET="$TIME_BUDGET" \
 PC_WEIGHT="$PC_WEIGHT" \
 PC_ALPHA="$PC_ALPHA" \
+PC_FOCAL_GAMMA="$PC_FOCAL_GAMMA" \
+KL_WEIGHT="$KL_WEIGHT" \
     python train.py 2>&1 | tee "$LOGFILE"
 EXIT_CODE=${PIPESTATUS[0]}
 

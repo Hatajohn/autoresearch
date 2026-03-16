@@ -39,6 +39,8 @@ PC_ALPHA="$3"
 TIME_BUDGET="$4"
 HYPOTHESIS="${5:-[fill in hypothesis]}"
 FINDING="${6:-[fill in finding after reviewing log]}"
+PC_FOCAL_GAMMA="${PC_FOCAL_GAMMA:-1.0}"
+KL_WEIGHT="${KL_WEIGHT:-0.01}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -118,6 +120,8 @@ cat >> "$SESSION_FILE" <<MDBLOCK
 | **val_bpb** | ${VAL_BPB} (${VS_BASELINE} vs baseline 1.183689) |
 | **PC_WEIGHT** | ${PC_WEIGHT} |
 | **PC_ALPHA** | ${PC_ALPHA} |
+| **PC_FOCAL_GAMMA** | ${PC_FOCAL_GAMMA} |
+| **KL_WEIGHT** | ${KL_WEIGHT} |
 | **TIME_BUDGET** | ${TIME_BUDGET}s |
 | **Steps** | ${STEPS} |
 | **Training seconds** | ${TRAIN_SECS} |
