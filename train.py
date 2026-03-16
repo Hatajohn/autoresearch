@@ -8,9 +8,14 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["PYTHONUNBUFFERED"] = "1"  # flush stdout immediately even when redirected to file
+# Cache compiled Triton/CUDA kernels to disk so subsequent runs skip recompilation entirely.
+# This eliminates the recurring 100-300s stalls that burn training budget.
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 import gc
 import math
+import signal
+import sys
 import time
 from dataclasses import dataclass, asdict
 
@@ -30,7 +35,12 @@ except Exception as e:
     fa3 = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-TIME_BUDGET = 360  # 6 minutes (prepare.py default is 300s)
+
+# All run constants are overridable via environment variables so the orchestration
+# script can sweep experiments without touching this file (and without invalidating
+# the torch.compile cache — graph structure is identical across all PC_ALPHA values).
+TIME_BUDGET = int(os.environ.get("TRAIN_TIME_BUDGET", "360"))
+
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -500,9 +510,9 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Predictive coding
-PC_WEIGHT = 0.1         # weight of predictive coding auxiliary loss (tune between 0.01–0.5)
-PC_ALPHA  = 0.1         # Option B: error routing strength into residual stream (0.0 = Option A)
+# Predictive coding — readable from env so orchestrator can sweep without recompile
+PC_WEIGHT = float(os.environ.get("PC_WEIGHT", "0.1"))
+PC_ALPHA  = float(os.environ.get("PC_ALPHA",  "0.1"))  # 0.0 = Option A (no routing)
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -513,6 +523,20 @@ DEVICE_BATCH_SIZE = 32   # per-device batch size (RTX 4080 16GB; H100 default wa
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Graceful shutdown: release GPU memory and flush logs when the process is
+    # terminated externally (SIGTERM from orchestrator or Ctrl-C / SIGINT).
+    def _handle_signal(signum, frame):
+        sig_name = signal.Signals(signum).name
+        print(f"\n[train] Received {sig_name} — flushing GPU and exiting cleanly.", flush=True)
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT,  _handle_signal)
+
     t_start = time.time()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)

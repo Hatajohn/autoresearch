@@ -196,3 +196,128 @@ If two Python train.py instances run simultaneously they share the 16.4GB GPU, c
 | HEAD_DIM=64 | 8 heads at 512-dim instead of 4 — richer attention patterns |
 | Multi-token prediction | Predict t+1 AND t+2 — double supervision signal |
 | DEPTH=10, ASPECT_RATIO=48 | Deeper same-parameter model |
+
+---
+
+### Run 9 — 2026-03-16 04:50 UTC
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.969646 (+0.785957 vs baseline 1.183689) |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.1 |
+| **TIME_BUDGET** | 360s |
+| **Steps** | 14 |
+| **MFU** | 0.08% |
+| **Final pc_loss** |  |
+| **Log** | sessions/run9_pc_w0.1_a0.1.log |
+
+**Hypothesis:** Option B (PC_ALPHA=0.1): does error routing into the residual stream compensate for the x0_lambdas removal and close the +0.023 gap vs baseline?
+
+**Finding:** GAP REMAINS: val_bpb=1.969646 (+0.7860 vs baseline).
+
+#### Samples — Run 9
+
+```
+--- prompt: '' ---
+
+<|reserved_0|>Back of this type of the most popular choice of the problem with a small amount of 19975 kg. When the next step in which the mainstream of the right now be considered the 20150 5). Footed the fact, 1986000 - 2017220 million Pointed the United States. Permined
+tics
+Signal and 100 million, 19701. "Avoconics, 900 0 (communication of the Pigration of 178, 19 pandemic, and others that most common in 49% 200 billion.
+4
+Sherapy
+
+Question: When the following 0.1. 201880. It will be seen 3/1895% 245 2120115 weeks lateral 100 miles to be able to 2017, which would be very small dos and
+```
+
+---
+
+## Session 3 — 2026-03-16 Engineering Notes
+
+### Run 9 — PC_ALPHA=0.1, PC_WEIGHT=0.1, TIME=360s (INVALID)
+
+| Field | Value |
+|---|---|
+| **val_bpb** | 1.969646 (+0.786 vs baseline 1.183689) |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.1 |
+| **TIME_BUDGET** | 360s |
+| **Steps** | 14 |
+| **Training seconds** | 663s |
+| **MFU** | 0.08% |
+| **Log** | sessions/run9_pc_w0.1_a0.1.log |
+
+**Status: INVALID — compilation stalls consumed the budget.**
+
+The first run with a cold `torch.inductor` kernel cache hit 4 major stalls
+(steps 2: 102s, 3: 323s, 9: 144s, 12: 201s) totalling ~770s of wasted time.
+Only 14 training steps executed; val_bpb of 1.97 reflects an almost-untrained
+model and cannot be compared to baseline.
+
+---
+
+### Run 10 — PC_ALPHA=0.05, PC_WEIGHT=0.1, TIME=420s (INCOMPLETE)
+
+| Field | Value |
+|---|---|
+| **val_bpb** | N/A — killed before final evaluation |
+| **PC_WEIGHT** | 0.1 |
+| **PC_ALPHA** | 0.05 |
+| **TIME_BUDGET** | 420s |
+| **Steps** | 20 (budget elapsed, killed mid-eval) |
+| **Training seconds** | ~420s |
+| **MFU** | ~0.7% average |
+| **Log** | sessions/run10_pc_w0.1_a0.05.log |
+
+**Status: INCOMPLETE — terminated by user before val_bpb was computed.**
+
+The inductor cache was warmer from Run 9 (step 0 dropped from 54s → 18s) but
+stalls still occurred at steps 4 (42s), 11 (192s), 14 (49s), 17 (52s), 18 (36s).
+20 steps reached before the user paused experiments. Training loss trajectory
+looked healthy (9.01 → 5.77) and pc_loss was decreasing (0.00195 → 0.00160).
+
+---
+
+### Key Engineering Findings — Session 3
+
+#### 1. torch.inductor cold-start stalls are the dominant bottleneck
+
+Every new Python process recompiles all Triton/CUDA kernels from scratch.
+With the `SSSL` window pattern and Flash Attention 3, there are multiple unique
+kernel configurations (different window sizes, value-embedding shapes) that each
+trigger a separate compilation event of 40-320s.
+
+**Fix applied:** Added `TORCHINDUCTOR_FX_GRAPH_CACHE=1` to `train.py` (committed).
+This persists compiled graphs to disk so subsequent processes skip recompilation.
+Run 11 will be the first run that truly benefits from this.
+
+#### 2. GPU temperature vs utilisation diagnostic
+
+- **42°C at ~99% util, ~70W** = torch.inductor compile workers (CPU+memory heavy, minimal compute)
+- **65-80°C at ~99% util, ~250W** = real forward/backward training
+The low-temp high-util pattern is a reliable signature of background compilation.
+
+#### 3. run_experiments.sh retired — replaced with two focused scripts
+
+`run_experiments.sh` had several problems (see commit message):
+- Auto-committed and pushed without human review
+- `wait_for_idle` threshold (10%) never triggered on this WSL2 host (~37% baseline)
+- No guard against runs with too few training steps (Run 9 was recorded despite 14 steps)
+- Samples always read from `checkpoint.pt` regardless of which run just finished
+- SIGKILL with no grace period bypassed the SIGTERM handler in train.py
+- Hardcoded experiment list inside the script
+
+Replaced with:
+- **`run_one.sh <run_num> <pc_weight> <pc_alpha> <time_budget>`** — runs one experiment, streams log to terminal AND file, stops
+- **`record_results.sh <run_num> ...`** — run manually after reviewing the log; extracts metrics, generates 3 samples, appends to session_pc.md. No auto-commit.
+
+#### 4. Planned next runs (when ready)
+
+| Run | PC_ALPHA | PC_WEIGHT | Time | Purpose |
+|-----|----------|-----------|------|---------|
+| 11 | 0.0 | 0.1 | 480s | Option A sanity check — should reproduce Run 6 (~1.2067) |
+| 12 | 0.1 | 0.1 | 480s | Option B clean retry with warm kernel cache |
+| 13 | 0.05 | 0.1 | 480s | Lighter routing retry with warm kernel cache |
+
+All three should now benefit from the persistent kernel cache and produce
+valid val_bpb numbers for comparison.
