@@ -292,6 +292,10 @@ class GPT(nn.Module):
             str(i): StochasticLayer(config.n_embd)
             for i in stochastic_indices
         })
+        # Integer-indexed sets for O(1) membership checks in forward — avoids
+        # str(i) conversion on every iteration inside the compiled loop.
+        self.stochastic_layer_set = stochastic_indices
+        self.value_embed_set = {i for i in range(config.n_layer) if has_ve(i, config.n_layer)}
         # Per-layer learnable precision scalars: weight each layer's PC error contribution.
         # Initialized to 1 (uniform), learned to up/down-weight layers during training.
         self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -495,9 +499,9 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = resid_scales[i] * x
             # Soft temporal compression at tier-transition layers (before the block)
-            if str(i) in self.summarizers:
+            if i in self.summarizer_layers:
                 x = self.summarizers[str(i)](x)
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            ve = self.value_embeds[str(i)](idx) if i in self.value_embed_set else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
             # Skip-layer PC: shallow layers predict 1 step back (adjacent), deep layers
             # predict 2-3 steps back — increasingly long-range top-down signals.
@@ -517,7 +521,7 @@ class GPT(nn.Module):
             gate = torch.sigmoid(block.routing_gate(norm(x)))   # (B, T, 1)
             x = x + gate * self.pc_alpha * pc_precision_routing[i] * (target_out - pred.detach()) / self.pc_scale
             # Stochastic reparameterization at designated layers
-            if str(i) in self.stochastic_layers:
+            if i in self.stochastic_layer_set:
                 x, kl_contrib = self.stochastic_layers[str(i)](x)
                 kl_loss = kl_loss + kl_contrib
             history = history[1:] + [x.detach()]  # rotate: drop oldest, append current
