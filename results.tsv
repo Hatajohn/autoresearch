@@ -4,3 +4,5 @@ commit	val_bpb	memory_gb	status	description
 8ef66cb	1.178470	3.3	keep	stock settings + checkpoint saving + __main__ guard — 173 steps/90M tok (TIME_BUDGET=300)
 1db8239	1.206693	15.9	keep	Option A generative PC (van Zwol 2024): tanh pred_heads, x0_lambdas removed, pc_loss↓ 0.00195→0.00088
 HEAD	1.203087	15.9	keep	Run 7 (PC_WEIGHT=0.0)=1.2062; Run 8 (PC_WEIGHT=0.01)=1.2031; gap=x0_lambdas not PC signal
+HEAD	1.969646	15.9	invalid	Run 9 (PC_ALPHA=0.1): cold inductor cache caused 4 stalls (323s worst); only 14 steps — result not comparable to baseline
+HEAD	N/A	15.9	incomplete	Run 10 (PC_ALPHA=0.05): killed before final eval; 20 steps, loss 9.01→5.77, pc_loss decreasing — warm cache, but no val_bpb
