@@ -306,9 +306,10 @@ class GPT(nn.Module):
             StochasticLayer(config.n_embd) if i in _stochastic_indices else _NoStoch()
             for i in range(config.n_layer)
         ])
-        # Per-layer learnable precision scalars: weight each layer's PC error contribution.
-        # Initialized to 1 (uniform), learned to up/down-weight layers during training.
-        self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
+        # Per-layer PC weights: simple positive scalars learned via softplus.
+        # Using softplus(pc_log_lambdas) avoids the ELBO instability where a Gaussian
+        # precision λ² → ∞ is rewarded whenever MSE < 1/λ², driving the loss to -∞.
+        self.pc_log_lambdas = nn.Parameter(torch.zeros(config.n_layer))
 
     @torch.no_grad()
     def init_weights(self):
@@ -334,7 +335,7 @@ class GPT(nn.Module):
             torch.nn.init.constant_(block.routing_gate.bias, 1.0)  # sigmoid(1)≈0.73
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
-        self.pc_lambdas.fill_(1.0)
+        self.pc_log_lambdas.fill_(0.0)   # softplus(0) ≈ 0.693 initial per-layer weight
         # Value embeddings (ModuleList contains nn.Embedding and _NoVE sentinels)
         for ve in self.value_embeds:
             if isinstance(ve, nn.Embedding):
@@ -427,7 +428,7 @@ class GPT(nn.Module):
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds if isinstance(ve, nn.Embedding))
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel())
         h = self.config.n_head
@@ -445,7 +446,7 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.pc_lambdas.numel()
+        scalars = self.resid_lambdas.numel() + self.pc_log_lambdas.numel()
         summarizers = sum(p.numel() for p in self.summarizers.parameters())
         stochastic = sum(p.numel() for p in self.stochastic_layers.parameters())
         total = wte + value_embeds + lm_head + transformer_matrices + scalars + summarizers + stochastic
@@ -473,7 +474,7 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         summarizer_params = list(self.summarizers.parameters())
         stochastic_params = list(self.stochastic_layers.parameters())
-        resid_params = [self.resid_lambdas, self.pc_lambdas] + attn_temp_params
+        resid_params = [self.resid_lambdas, self.pc_log_lambdas] + attn_temp_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
             len(pred_head_params) + len(summarizer_params) + len(stochastic_params))
@@ -515,9 +516,9 @@ class GPT(nn.Module):
         # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
         # tensor slice op rather than n_layer separate scalar-index ops.
         resid_scales = self.resid_lambdas.unbind(0)
-        lambda_sq = self.pc_lambdas.square()
-        pc_weights     = lambda_sq.unbind(0)
-        pc_log_weights = lambda_sq.clamp(min=1e-8).log().unbind(0)
+        # softplus gives positive per-layer weights without the ELBO's λ² * mse − log(λ²)
+        # instability (which drives λ→∞ whenever mse < 1/λ², pushing the loss to −∞).
+        pc_weights = F.softplus(self.pc_log_lambdas).unbind(0)
 
         # ── Phase 1: standard forward pass ───────────────────────────────────
         # Run all layers, collecting their outputs.  No PC corrections yet —
@@ -540,11 +541,10 @@ class GPT(nn.Module):
         # receive gradient through this path — only predictors (0..n-2) do.
         #
         # The routing gate weights which tokens receive a strong PC signal.
-        # At sigmoid(0)=0.5 initialisation every token is weighted equally;
-        # the gate learns to focus on tokens where prediction error is most
-        # informative.  Gradient flows back through the ELBO loss, not through
-        # an explicit residual correction (which would require a second forward
-        # pass to propagate downstream).
+        # At sigmoid(bias=1)≈0.73 initialisation most tokens contribute; the gate
+        # learns to focus or suppress.  Gradient flows back through the weighted-MSE
+        # loss (stable softplus layer weights), not through an explicit residual
+        # correction (which would require a second forward pass).
         # Normalise the final layer once; reuse as broadcast target (detached)
         # and as the lm_head input (with gradient).
         final_normed = norm(layer_outs[-1])
@@ -553,10 +553,9 @@ class GPT(nn.Module):
             block = self.transformer.h[i]
             h_i = norm(layer_outs[i])
             pred = block.pred_head(h_i)
-            raw_error = (broadcast - pred) / self.pc_scale          # (B, T, C)
-            token_pc  = (pc_weights[i] * raw_error.pow(2).mean(dim=-1)
-                         - pc_log_weights[i])                        # (B, T) ELBO
-            gate = torch.sigmoid(block.routing_gate(h_i)).squeeze(-1)  # (B, T)
+            raw_error = (broadcast - pred) / self.pc_scale               # (B, T, C)
+            token_pc  = pc_weights[i] * raw_error.pow(2).mean(dim=-1)   # (B, T) weighted MSE
+            gate = torch.sigmoid(block.routing_gate(h_i)).squeeze(-1)   # (B, T)
             pc_loss_map = pc_loss_map + gate * token_pc
 
         x = final_normed
@@ -841,6 +840,12 @@ if __name__ == "__main__":
     )
 
     print("Compiling model (first run: slow, cached thereafter)...", flush=True)
+    # Serialize inductor workers so per-kernel log lines aren't interleaved, and
+    # enable INFO-level compilation progress for the pre-warm phase only.
+    import logging as _stdlib_logging
+    import torch._inductor.config as _inductor_cfg
+    _inductor_cfg.compile_threads = 1
+    torch._logging.set_logs(inductor=_stdlib_logging.INFO, dynamo=_stdlib_logging.INFO)
     model = torch.compile(model, dynamic=False, fullgraph=True)
 
     # Pre-warm: run one dummy forward+backward to trigger all Triton kernel compilations
@@ -856,6 +861,9 @@ if __name__ == "__main__":
     model.zero_grad(set_to_none=True)
     del _dummy_x, _dummy_y, _d_loss, _d_aux
     torch.cuda.synchronize()
+    # Silence compilation logs now that all kernels are warmed; restore parallel threads.
+    torch._logging.set_logs(inductor=_stdlib_logging.WARNING, dynamo=_stdlib_logging.WARNING)
+    _inductor_cfg.compile_threads = None  # restore default (CPU count)
     print(f"  kernel pre-warm done in {time.time() - _t_prewarm:.0f}s", flush=True)
 
     # Flush memory fragmentation left by compile workers before training starts.
