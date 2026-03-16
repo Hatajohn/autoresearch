@@ -5,16 +5,16 @@
 # Run this MANUALLY after reviewing a log produced by run_one.sh.
 #
 # Usage:
-#   bash record_results.sh <run_num> <pc_weight> <pc_alpha> <time_budget_secs> \
+#   bash record_results.sh <run_num> <pc_weight> <time_budget_secs> \
 #       "<hypothesis>" "<finding>"
 #
 # The hypothesis and finding are free-text strings you write yourself after
 # looking at the log.  If omitted they default to placeholder text.
 #
 # Example:
-#   bash record_results.sh 11 0.1 0.0 480 \
-#       "Option A sanity check: PC_ALPHA=0.0 should reproduce Run 6 val_bpb" \
-#       "CONFIRMED: val_bpb=1.2071, matching Run 6 within noise"
+#   bash record_results.sh 15 0.1 600 \
+#       "Broadcast PC baseline: does pc3 match prior val_bpb?" \
+#       "CONFIRMED: val_bpb=1.19xx, broadcast PC overhead acceptable"
 #
 # What it does:
 #   1. Extracts metrics from the log
@@ -28,17 +28,16 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
-if [ $# -lt 4 ]; then
-    echo "Usage: bash record_results.sh <run_num> <pc_weight> <pc_alpha> <time_budget_secs> [hypothesis] [finding]" >&2
+if [ $# -lt 3 ]; then
+    echo "Usage: bash record_results.sh <run_num> <pc_weight> <time_budget_secs> [hypothesis] [finding]" >&2
     exit 1
 fi
 
 RUN_NUM="$1"
 PC_WEIGHT="$2"
-PC_ALPHA="$3"
-TIME_BUDGET="$4"
-HYPOTHESIS="${5:-[fill in hypothesis]}"
-FINDING="${6:-[fill in finding after reviewing log]}"
+TIME_BUDGET="$3"
+HYPOTHESIS="${4:-[fill in hypothesis]}"
+FINDING="${5:-[fill in finding after reviewing log]}"
 PC_FOCAL_GAMMA="${PC_FOCAL_GAMMA:-1.0}"
 KL_WEIGHT="${KL_WEIGHT:-0.01}"
 
@@ -46,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
-LOGFILE="sessions/run${RUN_NUM}_pc2_w${PC_WEIGHT}_a${PC_ALPHA}.log"
+LOGFILE="sessions/run${RUN_NUM}_pc3_w${PC_WEIGHT}.log"
 SESSION_FILE="sessions/session_pc.md"
 
 if [ ! -f "$LOGFILE" ]; then
@@ -119,7 +118,6 @@ cat >> "$SESSION_FILE" <<MDBLOCK
 |---|---|
 | **val_bpb** | ${VAL_BPB} (${VS_BASELINE} vs baseline 1.183689) |
 | **PC_WEIGHT** | ${PC_WEIGHT} |
-| **PC_ALPHA** | ${PC_ALPHA} |
 | **PC_FOCAL_GAMMA** | ${PC_FOCAL_GAMMA} |
 | **KL_WEIGHT** | ${KL_WEIGHT} |
 | **TIME_BUDGET** | ${TIME_BUDGET}s |

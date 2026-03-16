@@ -32,7 +32,6 @@ sys.argv = [sys.argv[0]]
 
 # train.py reads env-vars at module level; supply sane defaults if not set
 os.environ.setdefault("PC_WEIGHT",      "0.1")
-os.environ.setdefault("PC_ALPHA",       "0.1")
 os.environ.setdefault("PC_FOCAL_GAMMA", "1.0")
 os.environ.setdefault("KL_WEIGHT",      "0.01")
 
@@ -91,8 +90,6 @@ def test_eager_training_scale():
     # Verify key non-persistent buffers were filled (not left at zero)
     pc_scale = model.pc_scale.item()
     assert pc_scale > 0,  f"pc_scale zeroed ({pc_scale}); meta-init fill bug"
-    pc_alpha  = model.pc_alpha.item()
-    assert pc_alpha >= 0, f"pc_alpha negative ({pc_alpha})"
 
     x = torch.randint(0, config.vocab_size, (1, 256), device=DEVICE)
     y = torch.randint(0, config.vocab_size, (1, 256), device=DEVICE)

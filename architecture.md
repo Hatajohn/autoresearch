@@ -200,7 +200,6 @@ LR schedule: flat → warmdown over last 50% of budget, cosine to 0.
 | Buffer | Default | Effect |
 |--------|---------|--------|
 | `PC_WEIGHT` | 0.1 | Scales total `aux_loss` contribution to the gradient |
-| `pc_alpha` | 0.1 | Scales the top-down routing correction added back to `x` |
 | `pc_focal_gamma` | 1.0 | Exponent for output-difficulty weighting of `pc_loss` (0 = uniform) |
 | `kl_weight` | 0.01 | Scales the KL divergence loss from stochastic layers |
 | `pc_scale` | √512 ≈ 22.6 | Fixed denominator making prediction errors dimensionless (Bogacz 2017) |

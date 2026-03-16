@@ -38,7 +38,7 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evalua
 
 # All run constants are overridable via environment variables so the orchestration
 # script can sweep experiments without touching this file (and without invalidating
-# the torch.compile cache — graph structure is identical across all PC_ALPHA values).
+# the torch.compile cache — graph structure is unchanged across hyperparameter sweeps).
 TIME_BUDGET = int(os.environ.get("TRAIN_TIME_BUDGET", "360"))
 
 
@@ -225,9 +225,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
         self.pred_head = PredHead(config.n_embd)
-        # Per-token precision gate: learns which token positions should receive
-        # top-down PC correction.  Initialized to zero → sigmoid(0)=0.5 (neutral).
-        self.routing_gate = nn.Linear(config.n_embd, 1, bias=False)
+        # Per-token precision gate: weights how strongly each token's PC error
+        # enters the loss.  bias=True lets the gate start uniformly at
+        # sigmoid(bias)≈0.73 (bias≈1.0 init) so all tokens contribute at first;
+        # the gate learns to focus or suppress over training.
+        self.routing_gate = nn.Linear(config.n_embd, 1, bias=True)
 
     def forward(self, x, ve, cos_sin, window_size):
         out = x + self.attn(norm(x), ve, cos_sin, window_size)
@@ -267,11 +269,6 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
-        # PC routing strength as a non-persistent buffer so torch.compile sees a
-        # tensor placeholder rather than a Python literal — changing PC_ALPHA between
-        # experiments never invalidates the compiled graph.
-        self.register_buffer("pc_alpha", torch.tensor(PC_ALPHA, dtype=torch.bfloat16),
-                             persistent=False)
         # Focal gamma for output-difficulty weighting of pc_loss.
         # Stored as buffer (not literal) so sweeping PC_FOCAL_GAMMA never triggers recompile.
         self.register_buffer("pc_focal_gamma", torch.tensor(PC_FOCAL_GAMMA, dtype=torch.bfloat16),
@@ -321,6 +318,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
             torch.nn.init.zeros_(block.pred_head.proj.weight)
             torch.nn.init.zeros_(block.routing_gate.weight)
+            torch.nn.init.constant_(block.routing_gate.bias, 1.0)  # sigmoid(1)≈0.73
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.pc_lambdas.fill_(1.0)
@@ -346,7 +344,6 @@ class GPT(nn.Module):
         # Scalar buffers are zeroed by meta-device → to_empty() construction — restore
         # to their intended initial values.  Normal (non-meta) instantiation doesn't need
         # this, but it is idempotent so safe to call unconditionally.
-        self.pc_alpha.fill_(PC_ALPHA)
         self.pc_focal_gamma.fill_(PC_FOCAL_GAMMA)
         self.kl_weight.fill_(KL_WEIGHT)
         self.pc_scale.fill_(float(self.config.n_embd) ** 0.5)
@@ -532,7 +529,10 @@ class GPT(nn.Module):
         # informative.  Gradient flows back through the ELBO loss, not through
         # an explicit residual correction (which would require a second forward
         # pass to propagate downstream).
-        broadcast = norm(layer_outs[-1]).detach()
+        # Normalise the final layer once; reuse as broadcast target (detached)
+        # and as the lm_head input (with gradient).
+        final_normed = norm(layer_outs[-1])
+        broadcast = final_normed.detach()
         for i in range(self.config.n_layer - 1):
             block = self.transformer.h[i]
             h_i = norm(layer_outs[i])
@@ -543,7 +543,7 @@ class GPT(nn.Module):
             gate = torch.sigmoid(block.routing_gate(h_i)).squeeze(-1)  # (B, T)
             pc_loss_map = pc_loss_map + gate * token_pc
 
-        x = norm(layer_outs[-1])
+        x = final_normed
 
         softcap = 15
         logits = self.lm_head(x)
@@ -576,7 +576,8 @@ class GPT(nn.Module):
                 loss = token_ce  # (B, T) per-token losses — used by evaluate_bpb
             # Output-difficulty focal weighting: tokens where the model is most wrong
             # get the largest PC correction signal.  Fully detached — only scales magnitude.
-            difficulty = (token_ce.detach() / (token_ce.detach().mean() + 1e-6)).pow(self.pc_focal_gamma)
+            tc_det = token_ce.detach()
+            difficulty = (tc_det / (tc_det.mean() + 1e-6)).pow(self.pc_focal_gamma)
             pc_loss = (pc_loss_map * difficulty).mean() / len(self.transformer.h)
             # Fold kl_loss into pc_loss before returning so callers (including
             # evaluate_bpb in prepare.py) always receive a 2-tuple (loss, aux_loss).
@@ -742,7 +743,6 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Predictive coding — readable from env so orchestrator can sweep without recompile
 PC_WEIGHT       = float(os.environ.get("PC_WEIGHT",       "0.1"))
-PC_ALPHA        = float(os.environ.get("PC_ALPHA",        "0.1"))  # 0.0 = Option A (no routing)
 PC_FOCAL_GAMMA  = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
 KL_WEIGHT       = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
 

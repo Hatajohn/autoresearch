@@ -3,16 +3,16 @@
 # run_one.sh — launch a single training experiment
 #
 # Usage:
-#   bash run_one.sh <run_num> <pc_weight> <pc_alpha> <time_budget_secs>
+#   bash run_one.sh <run_num> <pc_weight> <time_budget_secs>
 #
 # Example:
-#   bash run_one.sh 11 0.1 0.0 480
+#   bash run_one.sh 15 0.1 600
 #
 # What it does:
 #   1. Refuses to start if train.py is already running
 #   2. Cleans up any orphaned compile_workers from a prior interrupted run
 #   3. Runs train.py with the given hyperparameters, streaming output live
-#   4. Saves the log to sessions/run<N>_pc_w<W>_a<A>.log
+#   4. Saves the log to sessions/run<N>_pc3_w<W>.log
 #   5. Prints a short metric summary when done
 #
 # It does NOT commit, push, sample, or chain into another run.
@@ -20,19 +20,17 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-if [ $# -ne 4 ]; then
-    echo "Usage: bash run_one.sh <run_num> <pc_weight> <pc_alpha> <time_budget_secs>" >&2
-    echo "Example: bash run_one.sh 11 0.1 0.0 480" >&2
+if [ $# -ne 3 ]; then
+    echo "Usage: bash run_one.sh <run_num> <pc_weight> <time_budget_secs>" >&2
+    echo "Example: bash run_one.sh 15 0.1 600" >&2
     echo "Optional env overrides: PC_FOCAL_GAMMA=1.0 KL_WEIGHT=0.01" >&2
     exit 1
 fi
 
 RUN_NUM="$1"
 PC_WEIGHT="$2"
-PC_ALPHA="$3"
-TIME_BUDGET="$4"
-# Optional env-var overrides for new sweepable hyperparameters.
-# Defaults match train.py so existing callers don't need to change.
+TIME_BUDGET="$3"
+# Optional env-var overrides for sweepable hyperparameters.
 PC_FOCAL_GAMMA="${PC_FOCAL_GAMMA:-1.0}"
 KL_WEIGHT="${KL_WEIGHT:-0.01}"
 
@@ -40,12 +38,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
-LOGFILE="sessions/run${RUN_NUM}_pc2_w${PC_WEIGHT}_a${PC_ALPHA}.log"
+LOGFILE="sessions/run${RUN_NUM}_pc3_w${PC_WEIGHT}.log"
 
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
-echo "[run_one] Run ${RUN_NUM}: PC_WEIGHT=${PC_WEIGHT}  PC_ALPHA=${PC_ALPHA}  TIME=${TIME_BUDGET}s"
+echo "[run_one] Run ${RUN_NUM}: PC_WEIGHT=${PC_WEIGHT}  TIME=${TIME_BUDGET}s"
 echo "[run_one] Log: ${LOGFILE}"
 
 # Hard stop if training is already running — we know the state, no need to guess
@@ -76,7 +74,6 @@ mkdir -p sessions
 echo "[run_one] Starting at $(date -u '+%Y-%m-%d %H:%M UTC')..."
 TRAIN_TIME_BUDGET="$TIME_BUDGET" \
 PC_WEIGHT="$PC_WEIGHT" \
-PC_ALPHA="$PC_ALPHA" \
 PC_FOCAL_GAMMA="$PC_FOCAL_GAMMA" \
 KL_WEIGHT="$KL_WEIGHT" \
     python train.py 2>&1 | tee "$LOGFILE"
@@ -97,4 +94,4 @@ MFU=$(    grep "mfu_percent:" "$LOGFILE" 2>/dev/null | tail -1 | awk '{print $2}
 
 echo "[run_one] Done — val_bpb=${VAL_BPB}  steps=${STEPS}  mfu=${MFU}%"
 echo "[run_one] Review ${LOGFILE}, then:"
-echo "[run_one]   bash record_results.sh ${RUN_NUM} ${PC_WEIGHT} ${PC_ALPHA} ${TIME_BUDGET} \"<hypothesis>\" \"<finding>\""
+echo "[run_one]   bash record_results.sh ${RUN_NUM} ${PC_WEIGHT} ${TIME_BUDGET} \"<hypothesis>\" \"<finding>\""
