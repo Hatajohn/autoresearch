@@ -7,10 +7,13 @@ Usage: uv run train.py
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["PYTHONUNBUFFERED"] = "1"  # flush stdout immediately even when redirected to file
-# Cache compiled Triton/CUDA kernels to disk so subsequent runs skip recompilation entirely.
-# This eliminates the recurring 100-300s stalls that burn training budget.
+# Cache compiled Triton/CUDA kernels to a persistent directory so the cache
+# survives reboots.  /tmp (the default) is wiped on every WSL/machine restart,
+# forcing a full recompile each time.  Persistent cache cuts pre-warm from
+# ~300s (cold) to ~10s (warm) on subsequent runs.
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
+                      os.path.expanduser("~/.cache/torchinductor"))
 
 import gc
 import math
@@ -34,12 +37,14 @@ except Exception as e:
     print(f"Flash Attention 3 unavailable ({e}), falling back to torch SDPA.", flush=True)
     fa3 = None
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, Tokenizer, make_dataloader, evaluate_bpb
 
 # All run constants are overridable via environment variables so the orchestration
 # script can sweep experiments without touching this file (and without invalidating
 # the torch.compile cache — graph structure is unchanged across hyperparameter sweeps).
 TIME_BUDGET = int(os.environ.get("TRAIN_TIME_BUDGET", "360"))
+RESUME_CHECKPOINT = os.environ.get("RESUME_CHECKPOINT", "")
+VAL_INTERVAL = int(os.environ.get("VAL_INTERVAL", "0"))  # 0 = disabled
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +60,8 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    ve_gate_channels: int = 0   # 0 = auto: max(32, n_embd // 16)
+    pc_head_dim: int = 64       # bottleneck dim for PC prediction heads
 
 
 def norm(x):
@@ -68,11 +75,22 @@ def has_ve(layer_idx, n_layer):
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
+    assert x.shape[3] % 2 == 0, f"head_dim must be even, got {x.shape[3]}"
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+def _make_causal_window_mask(T, window, device, dtype):
+    """Additive causal mask with optional sliding window (0 = attend, -inf = mask)."""
+    i = torch.arange(T, device=device).unsqueeze(1)   # (T, 1)
+    j = torch.arange(T, device=device).unsqueeze(0)   # (1, T)
+    causal = j > i                                    # upper triangle: future tokens
+    if window > 0 and window < T:
+        causal = causal | ((i - j) > window)          # also mask tokens beyond window
+    return torch.zeros(T, T, device=device, dtype=dtype).masked_fill(causal, float('-inf'))
 
 
 class CausalSelfAttention(nn.Module):
@@ -88,8 +106,9 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        vgc = config.ve_gate_channels or max(32, config.n_embd // 16)
+        self.ve_gate_channels = vgc
+        self.ve_gate = nn.Linear(vgc, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         # Learnable attention temperature (precision scalar): scales softmax sharpness.
         # β = attn_temp² + ε corresponds to inverse temperature in PC precision.
         # Initialized to 1 so scale ≈ 1/sqrt(head_dim) * 1 (neutral at step 0).
@@ -125,7 +144,12 @@ class CausalSelfAttention(nn.Module):
                 groups = self.n_head // self.n_kv_head
                 k_ = k_.repeat_interleave(groups, dim=1)
                 v_ = v_.repeat_interleave(groups, dim=1)
-            y = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
+            window = window_size[0]
+            if window < 0 or window >= T:
+                y = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
+            else:
+                mask = _make_causal_window_mask(T, window, q_.device, q_.dtype)
+                y = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=mask)
             y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -145,17 +169,6 @@ class MLP(nn.Module):
         return x
 
 
-class PredHead(nn.Module):
-    """Two-layer MLP predictor: out → hidden → prediction of x."""
-    def __init__(self, n_embd):
-        super().__init__()
-        self.fc   = nn.Linear(n_embd, n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd, bias=False)
-
-    def forward(self, x):
-        return x + self.proj(F.tanh(self.fc(x)))
-
-
 class StochasticLayer(nn.Module):
     """Reparameterized sampling layer: makes layer uncertainty explicit.
 
@@ -169,7 +182,7 @@ class StochasticLayer(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.mu_proj       = nn.Linear(n_embd, n_embd, bias=False)
-        self.log_sigma_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.log_sigma_proj = nn.Linear(n_embd, n_embd, bias=True)
         # Tensor flag: 1.0 in train, 0.0 in eval — avoids Python bool branch in forward.
         self.register_buffer("noise_scale", torch.ones(1))
 
@@ -188,8 +201,9 @@ class StochasticLayer(nn.Module):
         # so torch.compile emits one graph valid for both modes (no eval recompile).
         # Cast to mu's dtype so float32 buffer doesn't upcast bfloat16 activations under autocast.
         z = mu + self.noise_scale.to(dtype=mu.dtype) * sigma * torch.randn_like(mu)
-        # KL(q || N(0,1)) = 0.5 * (sigma² + mu² - log(sigma²) - 1)
-        kl = 0.5 * (sigma.pow(2) + mu.pow(2) - 2.0 * log_sigma - 1.0).mean()
+        # KL(q || N(0,1)) = 0.5 * (sigma² + mu² - log(sigma²) - 1); float32 avoids cancellation
+        kl = 0.5 * (sigma.float().pow(2) + mu.float().pow(2)
+                     - 2.0 * log_sigma.float() - 1.0).mean()
         return z, kl
 
 
@@ -228,9 +242,13 @@ class _NoVE(nn.Module):
 
 class _NoStoch(nn.Module):
     """Sentinel occupying non-stochastic slots in stochastic_layers ModuleList.
-    Returns (x, 0) so the forward loop needs no conditional."""
+    Returns (x, zero) so the forward loop needs no conditional."""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_zero", torch.zeros(()))
+
     def forward(self, x):
-        return x, x.new_zeros(())
+        return x, self._zero
 
 
 class Block(nn.Module):
@@ -238,17 +256,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-        self.pred_head = PredHead(config.n_embd)
-        # Per-token precision gate: weights how strongly each token's PC error
-        # enters the loss.  bias=True lets the gate start uniformly at
-        # sigmoid(bias)≈0.73 (bias≈1.0 init) so all tokens contribute at first;
-        # the gate learns to focus or suppress over training.
-        self.routing_gate = nn.Linear(config.n_embd, 1, bias=True)
 
     def forward(self, x, ve, cos_sin, window_size):
         out = x + self.attn(norm(x), ve, cos_sin, window_size)
         out = out + self.mlp(norm(out))
         return out
+
+
+AUX_HORIZONS = [(2, 0.15), (4, 0.05)]
 
 
 class GPT(nn.Module):
@@ -271,6 +286,10 @@ class GPT(nn.Module):
             for i in range(config.n_layer)
         ])
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.aux_lm_heads = nn.ModuleList([
+            nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            for _ in AUX_HORIZONS
+        ])
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         # Value embeddings — _NoVE sentinel at non-VE layers returns None, preserving the
         # existing `if ve is not None` guard in CausalSelfAttention without any dict lookup.
@@ -310,12 +329,22 @@ class GPT(nn.Module):
         # Using softplus(pc_log_lambdas) avoids the ELBO instability where a Gaussian
         # precision λ² → ∞ is rewarded whenever MSE < 1/λ², driving the loss to -∞.
         self.pc_log_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Stacked PC head weights — shape (n_layer, ...) so Phase 2 is a single
+        # batched matmul instead of a Python loop over blocks.
+        # pc_fc_w:   (n_layer, pc_head_dim, n_embd)  — projects n_embd → pc_head_dim (stored out×in)
+        # pc_proj_w: (n_layer, pc_head_dim, n_embd)  — projects pc_head_dim → n_embd via transpose contraction
+        self.pc_fc_w   = nn.Parameter(torch.zeros(config.n_layer, config.pc_head_dim, config.n_embd))
+        self.pc_proj_w = nn.Parameter(torch.zeros(config.n_layer, config.pc_head_dim, config.n_embd))
+        self.pc_gate_w = nn.Parameter(torch.zeros(config.n_layer, config.n_embd))  # (n_layer, C)
+        self.pc_gate_b = nn.Parameter(torch.ones(config.n_layer))                  # (n_layer,) scalar bias per layer
 
     @torch.no_grad()
     def init_weights(self):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        for head in self.aux_lm_heads:
+            torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
         # Transformer blocks — single pass covers attention, MLP, PC heads, and gates
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -329,12 +358,14 @@ class GPT(nn.Module):
             torch.nn.init.ones_(block.attn.attn_temp)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
-            torch.nn.init.zeros_(block.pred_head.proj.weight)
-            torch.nn.init.zeros_(block.routing_gate.weight)
-            torch.nn.init.constant_(block.routing_gate.bias, 1.0)  # sigmoid(1)≈0.73
+        # Stacked PC head weights — vectorised init outside block loop
+        torch.nn.init.uniform_(self.pc_fc_w, -s, s)
+        torch.nn.init.zeros_(self.pc_proj_w)      # zero-init → identity residual at step 0
+        torch.nn.init.zeros_(self.pc_gate_w)
+        self.pc_gate_b.fill_(1.0)                 # sigmoid(1) ≈ 0.73; most tokens active at init
         # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
+        # softplus(log(e-1)) = 1.0 exactly — neutral residual scale at init
+        self.resid_lambdas.fill_(math.log(math.e - 1))
         self.pc_log_lambdas.fill_(0.0)   # softplus(0) ≈ 0.693 initial per-layer weight
         # Value embeddings (ModuleList contains nn.Embedding and _NoVE sentinels)
         for ve in self.value_embeds:
@@ -344,7 +375,8 @@ class GPT(nn.Module):
         for sl in self.stochastic_layers:
             if isinstance(sl, StochasticLayer):
                 torch.nn.init.eye_(sl.mu_proj.weight)
-                torch.nn.init.constant_(sl.log_sigma_proj.weight, -3.0 / sl.log_sigma_proj.weight.size(0))
+                torch.nn.init.zeros_(sl.log_sigma_proj.weight)
+                torch.nn.init.constant_(sl.log_sigma_proj.bias, -3.0)
         # TemporalSummarizer: zero-init proj so residual starts as identity
         for summ in self.summarizers:
             if isinstance(summ, TemporalSummarizer):
@@ -395,6 +427,8 @@ class GPT(nn.Module):
             for i in range(n):
                 w = short_window if i < n // 2 else long_window
                 window_sizes.append((w, 0))
+            # Final layer always uses full context regardless of pattern —
+            # it produces the global broadcast target for predictive coding.
             window_sizes[-1] = (long_window, 0)
             return window_sizes
         if pattern == "LOG":
@@ -422,6 +456,8 @@ class GPT(nn.Module):
         for layer_idx in range(n):
             char = pattern[layer_idx % len(pattern)]
             window_sizes.append(char_to_window[char])
+        # Final layer always uses full context regardless of pattern —
+        # it produces the global broadcast target for predictive coding.
         window_sizes[-1] = (long_window, 0)
         return window_sizes
 
@@ -429,8 +465,8 @@ class GPT(nn.Module):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds if isinstance(ve, nn.Embedding))
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel())
+        nparams_exclude = (self.transformer.wte.weight.numel() + self.lm_head.weight.numel() +
+                          value_embeds_numel)
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
@@ -445,53 +481,76 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        aux_heads = sum(p.numel() for p in self.aux_lm_heads.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.pc_log_lambdas.numel()
         summarizers = sum(p.numel() for p in self.summarizers.parameters())
         stochastic = sum(p.numel() for p in self.stochastic_layers.parameters())
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars + summarizers + stochastic
+        pc_heads = sum(p.numel() for p in [self.pc_fc_w, self.pc_proj_w, self.pc_gate_w, self.pc_gate_b])
+        total = wte + value_embeds + lm_head + aux_heads + transformer_matrices + scalars + summarizers + stochastic + pc_heads
         return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
+            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head, 'aux_heads': aux_heads,
             'transformer_matrices': transformer_matrices, 'scalars': scalars,
-            'summarizers': summarizers, 'stochastic': stochastic, 'total': total,
+            'summarizers': summarizers, 'stochastic': stochastic, 'pc_heads': pc_heads, 'total': total,
+        }
+
+    @torch.no_grad()
+    def get_pc_diagnostics(self):
+        """Return live scalar stats for the PC system — pure parameter reads, no forward pass."""
+        n = self.config.n_layer
+        pc_weights  = F.softplus(self.pc_log_lambdas).tolist()          # per-layer PC loss weight
+        resid       = F.softplus(self.resid_lambdas).tolist()           # per-layer residual scale (effective)
+        gate_biases = self.pc_gate_b.tolist()                            # learned gate threshold
+        attn_temps  = [(block.attn.attn_temp.square() + 0.01).item()
+                       for block in self.transformer.h]                  # effective attn temperature
+        return {
+            "pc_weights":  pc_weights,
+            "resid":       resid,
+            "gate_biases": gate_biases,
+            "attn_temps":  attn_temps,
+            "n_layer":     n,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5,
+                        stoch_lr_scale=0.1):
         model_dim = self.config.n_embd
-        pred_head_params = [p for block in self.transformer.h
-                            for p in list(block.pred_head.parameters())
-                                     + list(block.routing_gate.parameters())]
-        pred_head_param_ids = {id(p) for p in pred_head_params}
+        pc_head_params = [self.pc_fc_w, self.pc_proj_w, self.pc_gate_w, self.pc_gate_b]
+        pc_head_param_ids = {id(p) for p in pc_head_params}
         # attn_temp is a per-layer scalar — route to resid_params (high scalar LR)
         # rather than matrix_params (Muon optimizer, wrong for scalars).
         attn_temp_params = [block.attn.attn_temp for block in self.transformer.h]
         attn_temp_param_ids = {id(p) for p in attn_temp_params}
-        exclude_ids = pred_head_param_ids | attn_temp_param_ids
+        exclude_ids = pc_head_param_ids | attn_temp_param_ids
         matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in exclude_ids]
         value_embeds_params = list(self.value_embeds.parameters())
+        # lm_head.weight is tied to wte.weight — counted once via embedding_params
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        aux_head_params = list(self.aux_lm_heads.parameters())
         summarizer_params = list(self.summarizers.parameters())
         stochastic_params = list(self.stochastic_layers.parameters())
         resid_params = [self.resid_lambdas, self.pc_log_lambdas] + attn_temp_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
-            len(pred_head_params) + len(summarizer_params) + len(stochastic_params))
+            len(aux_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(pc_head_params) + len(summarizer_params) + len(stochastic_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=aux_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            # pred_head in AdamW: kept out of Muon to avoid polluting backbone gradient groups
-            dict(kind='adamw', params=pred_head_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            # pc head params in AdamW: kept out of Muon to avoid polluting backbone gradient groups
+            dict(kind='adamw', params=pc_head_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # summarizer matrices use AdamW (small, non-square conv/proj weights)
             dict(kind='adamw', params=summarizer_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            # stochastic layer matrices (mu_proj, log_sigma_proj) use AdamW
-            dict(kind='adamw', params=stochastic_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            # stochastic layer matrices at a fraction of matrix_lr: Adam sign-normalises
+            # gradients so each element shifts by ±lr per step; at matrix_lr=0.04 this
+            # moves mu by ~0.04*sqrt(n_embd)≈0.9 per element in one step, destabilising
+            # the representations that PC loss measures.  stoch_lr_scale=0.1 keeps the
+            # per-step shift to ~0.09 per element, preserving near-identity init behaviour.
+            dict(kind='adamw', params=stochastic_params, lr=matrix_lr * stoch_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -511,14 +570,10 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        pc_loss_map = x.new_zeros(B, T)  # (B, T) per-token accumulator; reduced after logits
         kl_loss = x.new_zeros(())        # scalar KL accumulated across stochastic layers
         # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
         # tensor slice op rather than n_layer separate scalar-index ops.
-        resid_scales = self.resid_lambdas.unbind(0)
-        # softplus gives positive per-layer weights without the ELBO's λ² * mse − log(λ²)
-        # instability (which drives λ→∞ whenever mse < 1/λ², pushing the loss to −∞).
-        pc_weights = F.softplus(self.pc_log_lambdas).unbind(0)
+        resid_scales = F.softplus(self.resid_lambdas).unbind(0)
 
         # ── Phase 1: standard forward pass ───────────────────────────────────
         # Run all layers, collecting their outputs.  No PC corrections yet —
@@ -549,14 +604,22 @@ class GPT(nn.Module):
         # and as the lm_head input (with gradient).
         final_normed = norm(layer_outs[-1])
         broadcast = final_normed.detach()
-        for i in range(self.config.n_layer - 1):
-            block = self.transformer.h[i]
-            h_i = norm(layer_outs[i])
-            pred = block.pred_head(h_i)
-            raw_error = (broadcast - pred) / self.pc_scale               # (B, T, C)
-            token_pc  = pc_weights[i] * raw_error.pow(2).mean(dim=-1)   # (B, T) weighted MSE
-            gate = torch.sigmoid(block.routing_gate(h_i)).squeeze(-1)   # (B, T)
-            pc_loss_map = pc_loss_map + gate * token_pc
+        L = self.config.n_layer - 1
+        h_stack = torch.stack([norm(layer_outs[i]) for i in range(L)])   # (L, B, T, C)
+
+        # Residual pred_head: pred = h + proj(tanh(fc(h)))
+        fc_out  = torch.einsum('lbtc,ldc->lbtd', h_stack, self.pc_fc_w[:L])              # (L, B, T, pc_head_dim)
+        pred    = h_stack + torch.einsum('lbtd,ldc->lbtc', torch.tanh(fc_out), self.pc_proj_w[:L])  # (L, B, T, C)
+
+        raw_error = (broadcast.unsqueeze(0) - pred) / self.pc_scale                      # (L, B, T, C)
+        pc_w      = F.softplus(self.pc_log_lambdas[:L]).view(L, 1, 1)                    # (L, 1, 1)
+        token_pc  = pc_w * raw_error.pow(2).mean(dim=-1)                                 # (L, B, T)
+
+        # Gate: per-layer linear → sigmoid.  pc_gate_w is (n_layer, C), pc_gate_b is (n_layer,)
+        gate_logit = torch.einsum('lbtc,lc->lbt', h_stack, self.pc_gate_w[:L])           # (L, B, T)
+        gate       = torch.sigmoid(gate_logit + self.pc_gate_b[:L].view(L, 1, 1))        # (L, B, T)
+
+        pc_loss_map = (gate * token_pc).sum(dim=0)                                        # (B, T)
 
         x = final_normed
 
@@ -577,12 +640,12 @@ class GPT(nn.Module):
             if reduction == 'mean':
                 loss = token_ce.mean()
                 # Multi-timescale auxiliary losses (Parr et al. Section 5.2): predict k tokens ahead.
-                # Only added during training (reduction='mean'); evaluate_bpb uses reduction='none'
-                # and the shifted-target windows produce different-sized tensors that can't be summed
-                # with the per-token (B, T) map.
-                for horizon_k, horizon_w in ((2, 0.15), (4, 0.05)):
+                # Each horizon uses a dedicated unembedding head to avoid gradient interference.
+                # Only added during training (reduction='mean'); evaluate_bpb uses reduction='none'.
+                for head, (horizon_k, horizon_w) in zip(self.aux_lm_heads, AUX_HORIZONS):
+                    aux_logits = head(x[:, :-horizon_k])
                     aux = F.cross_entropy(
-                        logits[:, :-horizon_k].contiguous().view(-1, logits.size(-1)),
+                        aux_logits.contiguous().view(-1, aux_logits.size(-1)),
                         targets[:, horizon_k:].contiguous().view(-1),
                         ignore_index=-1, reduction='mean',
                     )
@@ -593,7 +656,7 @@ class GPT(nn.Module):
             # get the largest PC correction signal.  Fully detached — only scales magnitude.
             tc_det = token_ce.detach()
             difficulty = (tc_det / (tc_det.mean() + 1e-6)).pow(self.pc_focal_gamma)
-            pc_loss = (pc_loss_map * difficulty).mean() / len(self.transformer.h)
+            pc_loss = (pc_loss_map * difficulty).mean() / max(1, len(self.transformer.h) - 1)
             # Fold kl_loss into pc_loss before returning so callers (including
             # evaluate_bpb in prepare.py) always receive a 2-tuple (loss, aux_loss).
             aux_loss = pc_loss + self.kl_weight * kl_loss
@@ -746,7 +809,7 @@ WINDOW_PATTERN = "LOG"          # Geometric: each layer sees ~1.3x more context 
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
+EMBEDDING_LR = 0.1      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
@@ -760,10 +823,12 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 PC_WEIGHT       = float(os.environ.get("PC_WEIGHT",       "0.1"))
 PC_FOCAL_GAMMA  = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
 KL_WEIGHT       = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
+PC_DIAG_INTERVAL = int(os.environ.get("PC_DIAG_INTERVAL", "50"))   # steps between PC diagnostic lines (0 = off)
 
 # Model size
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 32   # per-device batch size (RTX 4080 16GB; H100 default was 128)
+PC_HEAD_DIM = int(os.environ.get("PC_HEAD_DIM", str(max(64, DEPTH * ASPECT_RATIO // 8))))
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -788,15 +853,18 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     torch.set_float32_matmul_precision("high")
+    torch._dynamo.config.cache_size_limit = 64
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda")
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     H100_BF16_PEAK_FLOPS = 989.5e12
 
     print("Loading tokenizer...", flush=True)
+    _t0 = time.time()
     tokenizer = Tokenizer.from_directory()
     vocab_size = tokenizer.get_vocab_size()
-    print(f"Vocab size: {vocab_size:,}", flush=True)
+    t_tokenizer = time.time() - _t0
+    print(f"Vocab size: {vocab_size:,} ({t_tokenizer:.1f}s)", flush=True)
 
     def build_model_config(depth):
         base_dim = depth * ASPECT_RATIO
@@ -806,17 +874,20 @@ if __name__ == "__main__":
             sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
             n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
             window_pattern=WINDOW_PATTERN,
+            pc_head_dim=PC_HEAD_DIM,
         )
 
     config = build_model_config(DEPTH)
     print(f"Model config: {asdict(config)}")
 
     print("Initializing model...", flush=True)
+    _t0 = time.time()
     with torch.device("meta"):
         model = GPT(config)
     model.to_empty(device=device)
     model.init_weights()
-    print(f"  model init done", flush=True)
+    t_model_init = time.time() - _t0
+    print(f"  model init done ({t_model_init:.1f}s)", flush=True)
 
     param_counts = model.num_scaling_params()
     print("Parameter counts:")
@@ -825,6 +896,10 @@ if __name__ == "__main__":
     num_params = param_counts['total']
     num_flops_per_token = model.estimate_flops()
     print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+    # Weight tying: lm_head shares weights with the input embedding.
+    # Must happen before setup_optimizer so the tied parameter is not in two groups.
+    model.lm_head.weight = model.transformer.wte.weight
 
     tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
     assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
@@ -839,14 +914,21 @@ if __name__ == "__main__":
         weight_decay=WEIGHT_DECAY,
     )
 
+    step = 0
+    total_training_time = 0.0
+    if RESUME_CHECKPOINT:
+        ckpt = torch.load(RESUME_CHECKPOINT, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        step = ckpt.get("step", 0)
+        total_training_time = ckpt.get("total_training_time", 0.0)
+        print(f"Resumed from {RESUME_CHECKPOINT} at step {step}", flush=True)
+
     print("Compiling model (first run: slow, cached thereafter)...", flush=True)
-    # Serialize inductor workers so per-kernel log lines aren't interleaved, and
-    # enable INFO-level compilation progress for the pre-warm phase only.
-    import logging as _stdlib_logging
-    import torch._inductor.config as _inductor_cfg
-    _inductor_cfg.compile_threads = 1
-    torch._logging.set_logs(inductor=_stdlib_logging.INFO, dynamo=_stdlib_logging.INFO)
+    _t0 = time.time()
     model = torch.compile(model, dynamic=False, fullgraph=True)
+    t_compile = time.time() - _t0
+    print(f"  torch.compile done ({t_compile:.1f}s)", flush=True)
 
     # Pre-warm: run one dummy forward+backward to trigger all Triton kernel compilations
     # before the training loop starts.  This makes step 0 fast and keeps the "Starting
@@ -861,10 +943,8 @@ if __name__ == "__main__":
     model.zero_grad(set_to_none=True)
     del _dummy_x, _dummy_y, _d_loss, _d_aux
     torch.cuda.synchronize()
-    # Silence compilation logs now that all kernels are warmed; restore parallel threads.
-    torch._logging.set_logs(inductor=_stdlib_logging.WARNING, dynamo=_stdlib_logging.WARNING)
-    _inductor_cfg.compile_threads = None  # restore default (CPU count)
-    print(f"  kernel pre-warm done in {time.time() - _t_prewarm:.0f}s", flush=True)
+    t_prewarm = time.time() - _t_prewarm
+    print(f"  kernel pre-warm done ({t_prewarm:.0f}s)", flush=True)
 
     # Flush memory fragmentation left by compile workers before training starts.
     torch.cuda.empty_cache()
@@ -897,28 +977,36 @@ if __name__ == "__main__":
     def get_weight_decay(progress):
         return WEIGHT_DECAY * (1 - progress)
 
+    KL_WARMUP_STEPS = 200  # ramp kl_weight from 0 → KL_WEIGHT over this many steps
+    def get_kl_weight(step):
+        return KL_WEIGHT * min(step / KL_WARMUP_STEPS, 1.0)
+
     # ---------------------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------------------
 
     t_start_training = time.time()
     smooth_train_loss = 0
-    total_training_time = 0
-    step = 0
+    # step and total_training_time already initialised (and possibly restored from checkpoint)
 
     while True:
         torch.cuda.synchronize()
         t0 = time.time()
+        model.kl_weight.fill_(get_kl_weight(step))
+        train_loss_accum = torch.zeros((), device=device)
+        train_pc_loss_accum = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
                 main_loss, aux_loss = model(x, y)
                 # aux_loss already contains pc_loss + kl_weight*kl_loss (folded in forward)
                 loss = main_loss + PC_WEIGHT * aux_loss
-            train_loss = main_loss.detach()
-            train_pc_loss = aux_loss.detach()
+            train_loss_accum += main_loss.detach()
+            train_pc_loss_accum += aux_loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
             x, y, epoch = next(train_loader)
+        train_loss = train_loss_accum / grad_accum_steps
+        train_pc_loss = train_pc_loss_accum / grad_accum_steps
 
         # Progress and schedules
         progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -933,8 +1021,9 @@ if __name__ == "__main__":
         # Clip gradients before the optimizer step.  Muon's NorMuon normalisation
         # already bounds backbone matrix steps; this catches runaway gradients on the
         # AdamW-trained params (pred_head, routing_gate, summarizers, stochastic layers).
+        # clip_grad_norm_ returns the pre-clip total norm.
         all_params = [p for g in optimizer.param_groups for p in g['params']]
-        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
@@ -943,8 +1032,10 @@ if __name__ == "__main__":
 
         # Fast fail: abort if loss is exploding or NaN
         if math.isnan(train_loss_f) or train_loss_f > 100:
-            print("FAIL")
-            exit(1)
+            print(f"FAIL at step {step}, loss={train_loss_f:.4f}, lrm={lrm:.4f}", flush=True)
+            torch.save({"model": model.state_dict(), "config": asdict(config), "step": step},
+                       "checkpoint_failed.pt")
+            sys.exit(1)
 
         torch.cuda.synchronize()
         t1 = time.time()
@@ -962,7 +1053,31 @@ if __name__ == "__main__":
         mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
         remaining = max(0, TIME_BUDGET - total_training_time)
 
-        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | pc_loss: {train_pc_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+        kl_w = model.kl_weight.item()
+        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | pc_loss: {train_pc_loss_f:.6f} | kl_w: {kl_w:.4f} | grad_norm: {grad_norm:.3f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+        if PC_DIAG_INTERVAL > 0 and (step + 1) % PC_DIAG_INTERVAL == 0:
+            d = model.get_pc_diagnostics()
+            n = d["n_layer"]
+            # Phase 2 loops over layers 0..n-2; last layer is broadcast target only.
+            # Mark it with "-" so it's visually clear it has no PC contribution.
+            def _fmt(vals, last_marker=True):
+                parts = [f"{v:.2f}" for v in vals[:-1]]
+                parts.append("  -- " if last_marker else f"{vals[-1]:.2f}")
+                return "[" + "  ".join(parts) + "]"
+            print(f"\n  pc_diag step {step + 1:05d}"
+                  f"\n    pc_weights : {_fmt(d['pc_weights'])}"
+                  f"\n    gate_biases: {_fmt(d['gate_biases'])}"
+                  f"\n    resid_λ    : {_fmt(d['resid'], last_marker=False)}"
+                  f"\n    attn_temps : {_fmt(d['attn_temps'], last_marker=False)}",
+                  flush=True)
+
+        if VAL_INTERVAL > 0 and step > 0 and step % VAL_INTERVAL == 0:
+            model.eval()
+            with autocast_ctx, torch.no_grad():
+                mid_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+            model.train()
+            print(f"\n  val_bpb (step {step}): {mid_bpb:.6f}", flush=True)
 
         # GC management (Python's GC causes ~500ms stalls)
         if step == 0:
@@ -995,10 +1110,17 @@ if __name__ == "__main__":
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
     ckpt_path = "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(config)}, ckpt_path)
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": asdict(config),
+        "step": step,
+        "total_training_time": total_training_time,
+    }, ckpt_path)
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")
+    print(f"startup_seconds:  {startup_time:.1f} (tokenizer={t_tokenizer:.1f}s, init={t_model_init:.1f}s, compile={t_compile:.1f}s, prewarm={t_prewarm:.0f}s)")
     print(f"training_seconds: {total_training_time:.1f}")
     print(f"total_seconds:    {t_end - t_start:.1f}")
     print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
