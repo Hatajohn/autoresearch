@@ -394,6 +394,16 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
+            # Multi-timescale auxiliary losses (Parr et al. Section 5.2): predict k tokens ahead.
+            # Reuses existing logits/lm_head — only the target window shifts.
+            # Weights chosen so total aux contribution is ~20% of the main CE loss.
+            for horizon_k, horizon_w in ((2, 0.15), (4, 0.05)):
+                aux = F.cross_entropy(
+                    logits[:, :-horizon_k].contiguous().view(-1, logits.size(-1)),
+                    targets[:, horizon_k:].contiguous().view(-1),
+                    ignore_index=-1, reduction=reduction,
+                )
+                loss = loss + horizon_w * aux
             # Output-difficulty focal weighting: tokens where the model is most wrong
             # get the largest PC correction signal.  Fully detached — only scales magnitude.
             token_loss = F.cross_entropy(
