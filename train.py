@@ -307,7 +307,7 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
+        # Transformer blocks — single pass covers attention, MLP, PC heads, and gates
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
         for block in self.transformer.h:
@@ -315,18 +315,20 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            torch.nn.init.ones_(block.attn.attn_temp)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
+            torch.nn.init.zeros_(block.pred_head.proj.weight)
+            torch.nn.init.zeros_(block.routing_gate.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.pc_lambdas.fill_(1.0)
         # Value embeddings
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # StochasticLayer: mu_proj = identity (no distortion), log_sigma_proj = -3 (tiny sigma)
         for sl in self.stochastic_layers.values():
             torch.nn.init.eye_(sl.mu_proj.weight)
@@ -334,15 +336,7 @@ class GPT(nn.Module):
         # TemporalSummarizer: zero-init proj so residual starts as identity
         for summ in self.summarizers.values():
             torch.nn.init.zeros_(summ.proj.weight)
-            torch.nn.init.ones_(summ.conv.weight)   # identity-like average at start
-        # PredHead: fc uniform (learns features), proj zero (no-op at step 0)
-        # routing_gate: zero init → sigmoid(0)=0.5, neutral correction at step 0
-        # attn_temp: ones init → scale = 1² + 0.01 ≈ 1.01, near-neutral precision
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.pred_head.fc.weight, -s, s)
-            torch.nn.init.zeros_(block.pred_head.proj.weight)
-            torch.nn.init.zeros_(block.routing_gate.weight)
-            torch.nn.init.ones_(block.attn.attn_temp)
+            torch.nn.init.ones_(summ.conv.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
