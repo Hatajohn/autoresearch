@@ -341,8 +341,8 @@ class GPT(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         # Embedding and unembedding
+        # lm_head.weight is tied to wte.weight in __main__ — init wte only
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         for head in self.aux_lm_heads:
             torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
         # Transformer blocks — single pass covers attention, MLP, PC heads, and gates
@@ -570,7 +570,7 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        kl_loss = x.new_zeros(())        # scalar KL accumulated across stochastic layers
+        kl_loss = torch.zeros((), dtype=torch.float32, device=x.device)  # float32: matches StochasticLayer KL dtype
         # Pre-compute per-layer scalars outside the loop so torch.compile sees a single
         # tensor slice op rather than n_layer separate scalar-index ops.
         resid_scales = F.softplus(self.resid_lambdas).unbind(0)

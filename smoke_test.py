@@ -391,16 +391,6 @@ def test_forward_numerics():
     # ── Step 9: pc_head_dim bottleneck — verify intermediate shape ───────────
     fc_out_shape: list[tuple] = []
 
-    def _pc_hook(module, inp, output):
-        pass   # we use a pre-hook on forward to capture intermediate tensors
-
-    # Monkey-patch to capture fc_out shape mid-forward
-    original_forward = type(model).forward
-
-    def _patched_forward(self, idx, targets=None, reduction='mean'):
-        # Run normally; capture pc_fc_w shape from the parameter itself
-        return original_forward(self, idx, targets, reduction)
-
     # The shapes are implicit in the parameters; verify via param shapes
     L = config.n_layer - 1
     assert model.pc_fc_w[:L].shape == (L, config.pc_head_dim, config.n_embd), \
@@ -527,23 +517,23 @@ def test_val_interval_fires():
     """VAL_INTERVAL fires at multiples of the interval, never at step 0."""
     print("Test 6  [VAL_INTERVAL control-flow]  ... ", end="", flush=True)
 
-    import train as _train_mod
-
-    original_fn = _train_mod.evaluate_bpb
+    original_fn = _train_module.evaluate_bpb
+    original_interval = _train_module.VAL_INTERVAL
     calls = []
 
     def _mock_eval(model, tokenizer, batch_size):
         calls.append("called")
         return 4.0
 
-    _train_mod.evaluate_bpb = _mock_eval
+    _train_module.evaluate_bpb = _mock_eval
+    _train_module.VAL_INTERVAL = 3
     try:
-        VAL_INTERVAL = 3
         for step in range(6):   # steps 0..5
-            if VAL_INTERVAL > 0 and step > 0 and step % VAL_INTERVAL == 0:
-                _train_mod.evaluate_bpb(None, None, 1)
+            if _train_module.VAL_INTERVAL > 0 and step > 0 and step % _train_module.VAL_INTERVAL == 0:
+                _train_module.evaluate_bpb(None, None, 1)
     finally:
-        _train_mod.evaluate_bpb = original_fn
+        _train_module.evaluate_bpb = original_fn
+        _train_module.VAL_INTERVAL = original_interval
 
     assert calls == ["called"], (
         f"evaluate_bpb should fire exactly once (at step 3), got calls at: {calls}"
