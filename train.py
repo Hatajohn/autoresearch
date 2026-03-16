@@ -192,6 +192,10 @@ class GPT(nn.Module):
         # experiments never invalidates the compiled graph.
         self.register_buffer("pc_alpha", torch.tensor(PC_ALPHA, dtype=torch.bfloat16),
                              persistent=False)
+        # Focal gamma for output-difficulty weighting of pc_loss.
+        # Stored as buffer (not literal) so sweeping PC_FOCAL_GAMMA never triggers recompile.
+        self.register_buffer("pc_focal_gamma", torch.tensor(PC_FOCAL_GAMMA, dtype=torch.bfloat16),
+                             persistent=False)
         # Per-layer learnable precision scalars: weight each layer's PC error contribution.
         # Initialized to 1 (uniform), learned to up/down-weight layers during training.
         self.pc_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -352,7 +356,7 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        pc_loss = x.new_zeros(())   # 0-D scalar; torch.compile reuses this allocation
+        pc_loss_map = x.new_zeros(B, T)  # (B, T) per-token accumulator; reduced after logits
         # History buffer for skip-layer PC: history[-1] is most recent, history[-k] is k steps back.
         # Pre-fill all slots with the initial embedding so every layer has a valid target
         # regardless of skip distance.  Static length = max_skip + 1 → compile-safe.
@@ -371,15 +375,14 @@ class GPT(nn.Module):
             target_out = history[-skip]    # static negative index; no dynamic dispatch
             pred = block.pred_head(norm(x))
             pc_denom = target_out.norm(dim=-1, keepdim=True) + 1e-6
-            # Loss path: gradient flows through pred (updates pred_head); fused by compiler.
-            pc_contrib = pc_weights[i] * ((target_out - pred) / pc_denom).pow(2).mean()
-            pc_loss = pc_loss + pc_contrib
+            # Loss path: accumulate per-token (mean over embed dim); reduced after logits.
+            pc_contrib = pc_weights[i] * ((target_out - pred) / pc_denom).pow(2).mean(dim=-1)
+            pc_loss_map = pc_loss_map + pc_contrib
             # Routing path: per-token precision gate scales correction per position.
             # gate ∈ (0,1); sigmoid(0)=0.5 initially → neutral, learns where to correct.
             gate = torch.sigmoid(block.routing_gate(norm(x)))   # (B, T, 1)
             x = x + gate * self.pc_alpha * ((target_out - pred.detach()) / pc_denom)
             history = history[1:] + [x.detach()]  # rotate: drop oldest, append current
-        pc_loss = pc_loss / len(self.transformer.h)
         x = norm(x)
 
         softcap = 15
@@ -391,6 +394,14 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
+            # Output-difficulty focal weighting: tokens where the model is most wrong
+            # get the largest PC correction signal.  Fully detached — only scales magnitude.
+            token_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1),
+                ignore_index=-1, reduction='none',
+            ).view(B, T).detach()
+            difficulty = (token_loss / (token_loss.mean() + 1e-6)).pow(self.pc_focal_gamma)
+            pc_loss = (pc_loss_map * difficulty).mean() / len(self.transformer.h)
             return loss, pc_loss
         return logits
 
@@ -551,8 +562,9 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Predictive coding — readable from env so orchestrator can sweep without recompile
-PC_WEIGHT = float(os.environ.get("PC_WEIGHT", "0.1"))
-PC_ALPHA  = float(os.environ.get("PC_ALPHA",  "0.1"))  # 0.0 = Option A (no routing)
+PC_WEIGHT       = float(os.environ.get("PC_WEIGHT",       "0.1"))
+PC_ALPHA        = float(os.environ.get("PC_ALPHA",        "0.1"))  # 0.0 = Option A (no routing)
+PC_FOCAL_GAMMA  = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
 
 # Model size
 DEPTH = 8               # number of transformer layers
