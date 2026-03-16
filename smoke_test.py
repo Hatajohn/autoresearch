@@ -389,8 +389,6 @@ def test_forward_numerics():
         model.resid_lambdas.fill_(math.log(math.e - 1))   # restore
 
     # ── Step 9: pc_head_dim bottleneck — verify intermediate shape ───────────
-    fc_out_shape: list[tuple] = []
-
     # The shapes are implicit in the parameters; verify via param shapes
     L = config.n_layer - 1
     assert model.pc_fc_w[:L].shape == (L, config.pc_head_dim, config.n_embd), \
