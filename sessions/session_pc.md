@@ -619,3 +619,158 @@ applied when this run started. Run 14 will be the first valid pc2 result.
 The `unbind()` fix resolves the *per-layer re-triggering* but does not eliminate the *initial set of novel kernels* the pc2 graph introduces. Run 14 was killed before the cache could fully warm.
 
 **Architecture is being redesigned.** Next run number: **15**.
+
+---
+
+### Run 15 pc3 — cache pre-warm only (INVALID)
+
+| Field | Value |
+|---|---|
+| **Status** | INVALID — cold cache, run killed to preserve budget |
+| **Log** | sessions/run15_pc2_w0.1_a0.1.log |
+
+No useful training data. Architecture changed substantially (pc2 → pc3: broadcast PC,
+LOG windowing, `nn.ModuleList` sentinels, `pc_log_lambdas`). Kernel cache fully cold.
+
+---
+
+### Run 16 pc3 — PC_WEIGHT=0.1, TIME=1200s (KILLED — pc_loss explosion)
+
+| Field | Value |
+|---|---|
+| **val_bpb** | N/A — killed after step 4 |
+| **Steps completed** | 5 (steps 0–4) |
+| **Log** | sessions/run16_pc3_w0.1.log |
+| **Architecture** | pc3: broadcast PC, LOG windowing, 8 layers, `pc_log_lambdas` |
+| **Pre-warm** | 42s (warm cache from Run 15) |
+
+**Status: KILLED** — catastrophic `pc_loss` explosion.
+
+**Observed step sequence:**
+
+| Step | dt (ms) | pc_loss | Notes |
+|---|---|---|---|
+| 0 | 29,149 | 0.015862 | Nominal — `proj.weight = 0`, `pred = h_i` |
+| 1 | 645,833 | 8.130677 | **Backward-pass recompile** (real tokens vs. dummy pre-warm) |
+| 2 | 73,215 | 16,012,055 | Second recompile; loss already catastrophic |
+| 3 | 60,605 | 27,910,940 | Continued divergence |
+| 4 | 114,350 | 1,800,665,344 | Run killed |
+
+---
+
+## Post-mortem: pc_loss explosion — root cause analysis
+
+### What was tried (and why it did not work)
+
+| Fix | Hypothesis at the time | Outcome |
+|---|---|---|
+| ELBO `λ² * mse − log(λ²)` → softplus `softplus(log_λ) * mse` | `pc_lambdas` driven to infinity by log term | Explosion still occurred |
+
+Both formulations produce identical behaviour: pc_loss starts tiny, then diverges. The
+precision parameter (`pc_lambdas` / `pc_log_lambdas`) is irrelevant to the explosion —
+the error signal `raw_error` itself is diverging.
+
+### Root cause: geometry mismatch + Adam's gradient normalization
+
+**The core asymmetry:**
+
+```
+broadcast = norm(layer_outs[-1]).detach()   # unit-RMS sphere  ||broadcast||² ≈ C
+pred      = h_i + proj(tanh(fc(h_i)))       # NOT normalized    ||pred||²  → ∞
+```
+
+`broadcast` lives on the unit-RMS sphere (`RMSNorm` output). `pred` starts there
+(because `proj.weight = 0` at init → `pred = h_i`), but is not *constrained* to stay
+there.
+
+**Why Adam makes it worse:**
+
+The AdamW update rule normalises every gradient to unit magnitude before scaling by `lr`:
+
+```
+update ≈ −lr × sign(gradient)    (simplified Adam)
+```
+
+Even if the true gradient to `proj.weight` is tiny (e.g., `1e-7` per element — as it is
+at step 0 with a near-zero `pc_loss`), Adam applies a full step of `lr = 0.00735` per
+element. After one gradient-accumulation cycle across 8 micro-steps:
+
+- Each element of `proj.weight` moves by ≈ `±0.007`
+- `||proj.weight||_F ≈ 0.007 × n_embd = 3.6` (for `n_embd = 512`)
+- The `proj` branch now produces a non-trivial contribution to `pred`
+
+**Why the backbone moving makes it catastrophic:**
+
+The backbone (transformer blocks 0–7) is updated by Muon at `lr ≈ 0.02` — extremely
+aggressive. After step 0, both `h_i` and `broadcast` have moved to new positions in
+representation space. `pred_head` learned to map step-0's `h_i` → step-0's `broadcast`,
+but now faces step-1's `(h_i, broadcast)` — a completely different pair in a randomly
+initialized network where intermediate layers are not yet correlated with the final layer.
+
+The result: `||broadcast − pred||` grows at every step because:
+
+1. `pred_head` is overfitting to the current batch's `(h_i, broadcast)` pair
+2. The backbone reshuffles `h_i` and `broadcast` between every step (Muon lr=0.02)
+3. `pred` is unnormalized so `||pred||` has no ceiling
+
+**Observed explosion ratio:**
+
+| Step | pc_loss | Growth factor |
+|---|---|---|
+| 0 | 0.016 | — |
+| 1 | 8.1 | ×511 |
+| 2 | 16,000,000 | ×1,975,000 |
+| 3 | 27,900,000 | ×1.7 |
+| 4 | 1,800,000,000 | ×65 |
+
+The `×511` jump at step 1 alone rules out a precision/scaling issue — that is a
+structural divergence.
+
+### Secondary issue: backward-pass recompile at step 1
+
+The pre-warm runs `forward + backward` on **zero tensors** (`torch.zeros`). The actual
+training backward involves different token indices (embedding lookups with real indices),
+which triggers a fresh `torch.compile` backward-graph trace at step 1. This consumed
+**645 s** of the 1200 s budget — more than half the run — before a single valid training
+step completed. Even if `pc_loss` had not exploded, this recompile makes pc3 effectively
+unusable unless the pre-warm uses real (or realistic) data instead of zeros.
+
+### Required fixes before the next run
+
+**Fix 1 — Normalize `pred`:**
+
+```python
+# In GPT.forward, Phase 2 loop:
+pred      = norm(block.pred_head(h_i))     # force pred onto the unit-RMS sphere
+raw_error = broadcast - pred               # both unit-RMS; ||error||² ≤ 4C (bounded)
+```
+
+This bounds `raw_error.pow(2).mean(-1) ≤ 4` unconditionally, regardless of how
+`proj.weight` evolves. The loss can no longer diverge through the geometry channel.
+
+**Fix 2 — Remove `pc_scale`:**
+
+`pc_scale = sqrt(n_embd) ≈ 22.6` was introduced when `pred` was *unnormalized* and had
+`||pred||² ≈ n_embd`. With both `broadcast` and `pred` on the unit-RMS sphere the natural
+error magnitude is `O(1)`, not `O(n_embd)`. Dividing by `pc_scale` shrinks the loss
+signal by `1/n_embd ≈ 0.002`, making the PC gradient negligibly small and slowing
+learning. Remove the division:
+
+```python
+raw_error = broadcast - pred               # no pc_scale division
+```
+
+**Fix 3 — Pre-warm with real tokens:**
+
+Pass a real mini-batch (not zeros) through `forward + backward` during pre-warm so the
+backward graph is compiled once against realistic inputs. This should eliminate the 645 s
+step-1 recompile.
+
+**Architectural note:** even with these fixes, `pred_head` is still chasing a moving
+target (the final-layer representation changes rapidly during early training). If the
+explosion recurs in a milder form, consider:
+
+- Reducing `lr` for `pred_head` parameters specifically (AdamW `param_groups`)
+- Using a stop-gradient on `h_i` inside `pred_head` to decouple the error signal from the
+  backbone gradient
+- Delaying the PC loss warm-up (ramp `PC_WEIGHT` from 0 over the first N steps)
