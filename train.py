@@ -169,15 +169,23 @@ class StochasticLayer(nn.Module):
         super().__init__()
         self.mu_proj       = nn.Linear(n_embd, n_embd, bias=False)
         self.log_sigma_proj = nn.Linear(n_embd, n_embd, bias=False)
+        # Tensor flag: 1.0 in train, 0.0 in eval — avoids Python bool branch in forward.
+        self.register_buffer("noise_scale", torch.ones(1))
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep noise_scale in sync with training mode so forward never branches on
+        # a Python bool — torch.compile sees one static graph for both modes.
+        self.noise_scale.fill_(1.0 if mode else 0.0)
+        return self
 
     def forward(self, x):
         mu        = self.mu_proj(x)
         log_sigma = self.log_sigma_proj(x).clamp(-6.0, 2.0)
         sigma     = log_sigma.exp()
-        if self.training:
-            z = mu + sigma * torch.randn_like(mu)
-        else:
-            z = mu
+        # noise_scale=1 during training, 0 during eval — tensor branch, not Python bool,
+        # so torch.compile emits one graph valid for both modes (no eval recompile).
+        z = mu + self.noise_scale * sigma * torch.randn_like(mu)
         # KL(q || N(0,1)) = 0.5 * (sigma² + mu² - log(sigma²) - 1)
         kl = 0.5 * (sigma.pow(2) + mu.pow(2) - 2.0 * log_sigma - 1.0).mean()
         return z, kl
@@ -402,10 +410,13 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.pc_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        summarizers = sum(p.numel() for p in self.summarizers.parameters())
+        stochastic = sum(p.numel() for p in self.stochastic_layers.parameters())
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + summarizers + stochastic
         return {
             'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+            'transformer_matrices': transformer_matrices, 'scalars': scalars,
+            'summarizers': summarizers, 'stochastic': stochastic, 'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
@@ -534,7 +545,10 @@ class GPT(nn.Module):
             ).view(B, T).detach()
             difficulty = (token_loss / (token_loss.mean() + 1e-6)).pow(self.pc_focal_gamma)
             pc_loss = (pc_loss_map * difficulty).mean() / len(self.transformer.h)
-            return loss, pc_loss, kl_loss
+            # Fold kl_loss into pc_loss before returning so callers (including
+            # evaluate_bpb in prepare.py) always receive a 2-tuple (loss, aux_loss).
+            aux_loss = pc_loss + self.kl_weight * kl_loss
+            return loss, aux_loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -825,10 +839,11 @@ if __name__ == "__main__":
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
-                main_loss, pc_loss, kl_loss = model(x, y)
-                loss = main_loss + PC_WEIGHT * pc_loss + model.kl_weight * kl_loss
+                main_loss, aux_loss = model(x, y)
+                # aux_loss already contains pc_loss + kl_weight*kl_loss (folded in forward)
+                loss = main_loss + PC_WEIGHT * aux_loss
             train_loss = main_loss.detach()
-            train_pc_loss = pc_loss.detach()
+            train_pc_loss = aux_loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
             x, y, epoch = next(train_loader)
