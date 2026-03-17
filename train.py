@@ -876,6 +876,7 @@ PC_WEIGHT        = float(os.environ.get("PC_WEIGHT",        "0.02"))
 PC_FOCAL_GAMMA   = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
 KL_WEIGHT        = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
 PC_DIAG_INTERVAL = int(os.environ.get("PC_DIAG_INTERVAL",  "50"))   # steps between PC diagnostic lines (0 = off)
+PC_EMA_DECAY     = float(os.environ.get("PC_EMA_DECAY",    "0.99")) # EMA decay for pc_ema target buffers (~100-step time constant)
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -1008,17 +1009,20 @@ if __name__ == "__main__":
             _d_eval_loss, _d_eval_aux = model(_dummy_x, _dummy_y, reduction='none')
     del _d_eval_loss, _d_eval_aux
     # Step-0 diagnostic: log logit std and raw CE before any weight update.
-    # Compares against the smoke-test value (≈10.80) to confirm prod matches expectations.
+    # Uses RANDOM targets so self-prediction with all-zero inputs doesn't trivially
+    # yield CE≈0 (run21 confirmed raw_CE=0.013 with _dummy_y=zeros — meaningless).
+    # Random targets give a genuine measure of output distribution sharpness.
+    _diag_y = torch.randint(0, config.vocab_size, _dummy_x.shape, device=device)
     with torch.no_grad():
         with autocast_ctx:
             _step0_logits = model(_dummy_x)  # (B, T, vocab_size) — no targets → returns logits
         _step0_logit_std = _step0_logits.float().std().item()
         _step0_raw_ce = F.cross_entropy(
-            _step0_logits.float().view(-1, _step0_logits.size(-1)), _dummy_y.view(-1)
+            _step0_logits.float().view(-1, _step0_logits.size(-1)), _diag_y.view(-1)
         ).item()
         print(f"  step-0 diagnostic: logit_std={_step0_logit_std:.4f}, raw_CE={_step0_raw_ce:.4f} nats "
               f"(expected ≈10.5; smoke test ≈10.80)", flush=True)
-    del _dummy_x, _dummy_y, _step0_logits
+    del _dummy_x, _dummy_y, _diag_y, _step0_logits
     torch.cuda.synchronize()
     t_prewarm = time.time() - _t_prewarm
     print(f"  kernel pre-warm done ({t_prewarm:.0f}s)", flush=True)
@@ -1106,9 +1110,8 @@ if __name__ == "__main__":
         optimizer.step()
         model.zero_grad(set_to_none=True)
         # Update PC EMA target buffer outside the compiled graph (buffer is read-only inside forward).
-        # decay=0.99 → ~100-step time constant; ensures targets drift slowly relative to PC head LR.
         with torch.no_grad():
-            model.pc_ema.mul_(0.99).add_(_last_layer_means, alpha=0.01)
+            model.pc_ema.mul_(PC_EMA_DECAY).add_(_last_layer_means, alpha=1.0 - PC_EMA_DECAY)
 
         train_loss_f = train_loss.item()
         train_pc_loss_f = train_pc_loss.item()
