@@ -727,8 +727,74 @@ def test_val_interval_fires():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _check_no_training_running():
+    """Abort early if a training process or significant GPU allocation is detected.
+
+    Two independent signals:
+      1. Process scan — any python process whose cmdline contains 'train.py'
+         (covers both 'python train.py' and 'torchrun ... train.py').
+      2. GPU memory — if another process has already allocated >500 MB of VRAM
+         the tests will likely OOM or produce misleading timings.
+    """
+    import subprocess
+
+    # ── Signal 1: process scan ───────────────────────────────────────────────
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-af", "train.py"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        if out:
+            # Filter out this very process (smoke_test.py imports train.py,
+            # so its own cmdline doesn't contain train.py directly — but be safe).
+            own_pid = str(os.getpid())
+            offending = [ln for ln in out.splitlines() if not ln.startswith(own_pid)]
+            if offending:
+                print(
+                    f"\n\033[33mWARNING: training process(es) appear to be running:\033[0m"
+                )
+                for ln in offending:
+                    print(f"  {ln}")
+                print(
+                    "Smoke tests allocate ~2 GB of VRAM and will interfere with an "
+                    "active training run.\nAbort and re-run once training has finished, "
+                    "or pass --force to skip this check."
+                )
+                if "--force" not in _smoke_args:
+                    sys.exit(1)
+                print("  --force passed; continuing anyway.\n")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass  # pgrep returns exit 1 when no match; FileNotFoundError if not installed
+
+    # ── Signal 2: GPU memory already in use ──────────────────────────────────
+    if torch.cuda.is_available():
+        # Query free vs total memory on the default device.
+        free_bytes, total_bytes = torch.cuda.mem_get_info(DEVICE)
+        used_bytes = total_bytes - free_bytes
+        used_pct = used_bytes / total_bytes
+        used_mb  = used_bytes / (1024 ** 2)
+        total_mb = total_bytes / (1024 ** 2)
+        # Use 30% of total VRAM as the trip-wire.  The Flash Attention 3 kernel
+        # cache consumes ~1.3 GB on a 16 GB card (~8%) at import time — well below
+        # this threshold.  Any active training run (>10 GB) will exceed it.
+        threshold_pct = 0.30
+        if used_pct > threshold_pct:
+            print(
+                f"\n\033[33mWARNING: GPU already has {used_mb:.0f} / {total_mb:.0f} MB "
+                f"allocated ({used_pct:.0%} > {threshold_pct:.0%} threshold).\033[0m"
+            )
+            print(
+                "Another process may be using the GPU. Smoke tests may OOM or produce "
+                "misleading results.\nPass --force to skip this check."
+            )
+            if "--force" not in _smoke_args:
+                sys.exit(1)
+            print("  --force passed; continuing anyway.\n")
+
+
 if __name__ == "__main__":
     no_compile = "--no-compile" in _smoke_args
+
+    _check_no_training_running()
 
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
