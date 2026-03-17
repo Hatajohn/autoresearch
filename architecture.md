@@ -1,6 +1,6 @@
 # Model Architecture — pc-architecture-v2
 
-> Config: `n_layer=8, n_embd=512, n_head=4, n_kv_head=4, head_dim=128, seq_len=2048`
+> Config: `n_layer=8, n_embd=512, n_head=4, n_kv_head=4, head_dim=128, seq_len=2048, pc_head_dim=64, ve_gate_channels=32`
 
 ---
 
@@ -10,47 +10,47 @@
 %%{init: {"theme": "dark"}}%%
 flowchart TD
     TOK["tokens  B x T"]
-    EMB["Embedding  vocab -> 512  bf16"]
+    EMB["Embedding  vocab -> 512  bf16\n(weight-tied to lm_head)"]
     N0["RMSNorm"]
     TOK --> EMB --> N0
 
     subgraph LAYER["One layer  repeated x8  i = 0...7"]
-        SCALE["resid_lambdas[i] * x"]
+        SCALE["softplus(resid_lambdas[i]) * x\nalways-positive learned residual scale"]
         SUMM["TemporalSummarizer  layers 2 and 4 only\nConv1d causal  + Linear  residual add"]
-        ATTN["CausalSelfAttention\nRoPE   QK-norm   windowed FA3\nattn_temp^2 precision   value embeds on alt layers"]
+        ATTN["CausalSelfAttention\nRoPE   QK-norm   windowed FA3\nattn_temp^2 precision   value embeds on alt layers\nve_gate_channels=32"]
         MLP_N["MLP   512 -> 2048 -> 512\nReLU^2 activation"]
-        STOCH["StochasticLayer  layers 2 and 5 only\nz = mu + noise * sigma   adds KL loss"]
+        STOCH["StochasticLayer  layers 2 and 5 only\nz = mu + noise * sigma   KL in float32\nadds KL loss"]
         layer_outs["layer_outs[i] = x\ncollect all 8 outputs"]
 
         SCALE --> SUMM --> ATTN --> MLP_N
         MLP_N --> STOCH --> layer_outs
     end
 
-    subgraph PHASE2["Phase 2  broadcast PC  after all layers"]
-        BROADCAST["broadcast = norm(layer_outs[-1]).detach()\nfinal layer is the global top-down target"]
-        PRED["PredHead(norm(layer_outs[i]))\npredict broadcast from each layer 0..n-2"]
-        ERR["raw_error = (broadcast - pred) / pc_scale"]
-        ELBO["ELBO  L^2 * err^2 - log(L^2)"]
-        GATE["routing_gate  sigmoid gate  (B,T)\nweights which tokens get strong PC signal"]
-        PCLOSS_A["pc_loss_map += gate * ELBO\ngradient flows back to each layer's params"]
-        BROADCAST --> PRED --> ERR --> ELBO --> PCLOSS_A
+    subgraph PHASE2["Phase 2  hierarchical PC  after all layers"]
+        TARGETS["targets_stack[i] = norm(layer_outs[i+1]).detach()\nlayer i predicts its immediate neighbour\n(L, B, T, C)  — upper layer detached"]
+        PRED["residual bottleneck pred head\npred = h + proj(tanh(fc(h)))\n(L, B, T, pc_head_dim=64) -> (L, B, T, 512)"]
+        ERR["raw_error = (targets_stack - pred) / pc_scale"]
+        PCWEIGHT["pc_w = softplus(pc_log_lambdas[i])\ntoken_pc = pc_w * mean(raw_error^2, dim=C)"]
+        GATE["learned routing gate  per-layer\nsigmoid(h.detach() @ pc_gate_w + pc_gate_b)  (L, B, T)\nh detached — backbone cannot null the gate"]
+        PCLOSS_A["pc_loss_map = sum_L(gate * token_pc)  (B, T)\ngradient flows back to each layer's params"]
+        TARGETS --> PRED --> ERR --> PCWEIGHT --> PCLOSS_A
         ERR --> GATE --> PCLOSS_A
     end
 
     N0 --> SCALE
-    layer_outs --> BROADCAST
+    layer_outs --> TARGETS
     layer_outs --> OUTNORM
 
     OUTNORM["RMSNorm"]
-    HEAD["lm_head   Linear 512 -> vocab   no bias"]
+    HEAD["lm_head   Linear 512 -> vocab   no bias\n(weight-tied to wte)"]
     CAP["softcap   15 * tanh(logits / 15)"]
     OUTNORM --> HEAD --> CAP
 
     subgraph LOSS["Loss  training only"]
         CE["cross-entropy per token  B x T"]
-        AUX["+ 0.15 * CE t+2   + 0.05 * CE t+4\nmulti-timescale auxiliary"]
+        AUX["+ 0.15 * CE t+2   + 0.05 * CE t+4\nper-horizon dedicated aux_lm_heads  std=0.001 init"]
         FOCAL["difficulty = (token_ce / mean)^gamma\nfocal weight  hard tokens get more PC signal"]
-        PCLOSS["pc_loss = mean(loss_map * difficulty) / 8\n+ kl_weight * kl_loss"]
+        PCLOSS["pc_loss = mean(loss_map * difficulty) / 7\n+ kl_weight * kl_loss"]
         TOTAL["total = main_loss + PC_WEIGHT * aux_loss"]
         CE --> AUX --> TOTAL
         CE --> FOCAL --> PCLOSS --> TOTAL
@@ -79,7 +79,7 @@ flowchart TD
     class ATTN           attn
     class MLP_N          mlp
     class layer_outs  buf
-    class BROADCAST,PRED,ERR,ELBO,GATE,PCLOSS_A  pc
+    class BROADCAST,PRED,ERR,PCWEIGHT,GATE,PCLOSS_A  pc
     class STOCH          stoch
     class HIST           hist
     class HEAD,CAP       out
@@ -130,7 +130,7 @@ xychart-beta
 
 ---
 
-## Broadcast PC Targets
+## Hierarchical PC Targets
 
 ```mermaid
 %%{init: {"theme": "dark"}}%%
@@ -142,24 +142,24 @@ flowchart LR
     L4["L4"]
     L5["L5"]
     L6["L6"]
-    L7["L7  broadcast target"]
+    L7["L7"]
 
-    L0 -->|predict| L7
-    L1 -->|predict| L7
-    L2 -->|predict| L7
-    L3 -->|predict| L7
-    L4 -->|predict| L7
-    L5 -->|predict| L7
+    L0 -->|predict| L1
+    L1 -->|predict| L2
+    L2 -->|predict| L3
+    L3 -->|predict| L4
+    L4 -->|predict| L5
+    L5 -->|predict| L6
     L6 -->|predict| L7
 
     classDef pred   fill:#78350f,stroke:#fbbf24,color:#fef3c7,stroke-width:2px
     classDef target fill:#4c1d95,stroke:#a78bfa,color:#ede9fe,stroke-width:3px
 
     class L0,L1,L2,L3,L4,L5,L6  pred
-    class L7  target
+    class L1,L2,L3,L4,L5,L6,L7  target
 ```
 
-All layers 0..n-2 predict the final layer's normalised output (broadcast target, shown in purple). This is the most faithful implementation of hierarchical predictive coding: the highest level of the hierarchy sets a global top-down prediction that every lower level must learn to match. Layer 7 is detached — it sets the context without receiving gradient through the PC path.
+Each layer predicts its immediate neighbour: layer i predicts `norm(layer_outs[i+1]).detach()`. This restores the classical PC hierarchy — each level only needs to account for the representational shift introduced by the next layer, not the full transformation from local features to global context. The upper layer target is always detached so gradient flows only into the predictor, not the target.
 
 ---
 
@@ -176,22 +176,71 @@ All layers 0..n-2 predict the final layer's normalised output (broadcast target,
 | 6 | — | — | — | 4 |
 | 7 | — | ✓ | — | 4 |
 
+TemporalSummarizer slots: `{n//3, 2*(n//3)}` = {2, 4} for n=8.
+StochasticLayer slots: `range(2, n_layer, 3)` = {2, 5} for n=8.
+
+---
+
+## PC Prediction Head
+
+Each of the n-1 predictor layers uses a shared-weight **residual bottleneck** head:
+
+```
+pred = h + pc_proj_w[i]ᵀ · tanh(pc_fc_w[i] · h)
+```
+
+where `pc_fc_w: (n_layer, pc_head_dim, n_embd)` and `pc_proj_w: (n_layer, pc_head_dim, n_embd)`.
+Both are batched over the layer dimension via einsum, so Phase 2 is a single kernel launch.
+Both `pc_fc_w` and `pc_proj_w` are zero-initialised so `pred = h` (identity residual) at step 0 and both weights grow together from the first gradient step, avoiding a discontinuous jump in prediction error.
+
+`pc_head_dim` defaults to `max(64, DEPTH * ASPECT_RATIO // 8)` = 64 and is sweepable via `PC_HEAD_DIM`.
+
+The routing gate is a learned linear probe on a **detached** copy of the hidden state:
+
+```
+gate[i, b, t] = sigmoid(h[i, b, t].detach() · pc_gate_w[i] + pc_gate_b[i])
+```
+
+Detaching `h` prevents the backbone from driving gate → 0 as a shortcut to minimize `pc_loss_map` without improving representations. `pc_gate_b` is initialised to 1.0 so `sigmoid(1) ≈ 0.73`; most tokens contribute at init.
+
 ---
 
 ## Parameter Groups and Optimizers
 
 | Group | Parameters | Optimizer | LR |
 |-------|-----------|-----------|-----|
-| `wte` | vocab × 512 | AdamW | `embedding_lr / √(512/768)` |
-| `lm_head` | vocab × 512 | AdamW | `unembedding_lr / √(512/768)` |
-| `value_embeds` (×4) | 4 × vocab × 512 | AdamW | `embedding_lr / √(512/768)` |
-| `resid_lambdas`, `pc_lambdas`, `attn_temp` (24 scalars) | 24 | AdamW | `scalar_lr × 0.01` |
-| `pred_head` + `routing_gate` (×8) | ~4.2 M | AdamW | `matrix_lr` |
+| `wte` (= `lm_head`, weight-tied) | vocab × 512 | AdamW | `embedding_lr × √(768/512)` |
+| `aux_lm_heads` (×2 horizons) | 2 × vocab × 512 | AdamW | `unembedding_lr × √(768/512)` |
+| `value_embeds` (×4) | 4 × vocab × 512 | AdamW | `embedding_lr × √(768/512)` |
+| `resid_lambdas`, `pc_log_lambdas`, `attn_temp` (24 scalars) | 24 | AdamW | `scalar_lr × 0.01` |
+| PC heads (`pc_fc_w`, `pc_proj_w`, `pc_gate_w`, `pc_gate_b`) | ~540 K | AdamW | `matrix_lr × 0.1` |
 | `TemporalSummarizer` (×2) | ~530 K | AdamW | `matrix_lr` |
-| `StochasticLayer` (×2) | ~1 M | AdamW | `matrix_lr` |
+| `StochasticLayer` (×2) | ~1 M | AdamW | `matrix_lr × 0.1` |
 | All other backbone matrices | ~29 M | **Muon** | `matrix_lr` |
 
+Notes:
+- `lm_head.weight` is tied to `wte.weight` after `init_weights()` and before `setup_optimizer()`. The parameter is counted and updated once via `embedding_params`.
+- `aux_lm_heads` are independent unembedding heads (one per horizon in `AUX_HORIZONS`), initialised with `std=0.001`. They share the `unembedding_lr` group but are not tied to `wte`.
+- `PC heads` use `matrix_lr × 0.1`. Both `pc_fc_w` and `pc_proj_w` start at zero (identity residual). At full `matrix_lr=0.04` the Adam sign-step would cause rapid divergence against the simultaneously shifting backbone targets; the 0.1 scale keeps early steps stable.
+- `StochasticLayer` uses `matrix_lr × stoch_lr_scale` (default 0.1). Adam sign-normalises gradients; at full `matrix_lr=0.04` each element shifts by ~0.9 per step, destabilising the near-identity init. The 0.1 scale keeps per-step shifts to ~0.09.
+- LR scales by `1/√(n_embd/768)` — tuned at 768; wider models automatically get lower LR.
+- Muon `weight_decay` is annealed linearly to 0 over training; AdamW groups use `weight_decay=0`.
+
 LR schedule: flat → warmdown over last 50% of budget, cosine to 0.
+
+---
+
+## Expected Step-0 Loss
+
+Random-init lower bound: `ln(vocab_size)` = `ln(8192)` ≈ **9.01 nats**.
+
+Step-0 loss is typically **10–11 nats**, above this ceiling. This is expected and not a bug:
+
+- `resid_lambdas` are initialised so `softplus(x) = 1.0`, but they are free parameters and can drift above 1 early in training, amplifying activations and making the distribution non-uniform before any useful features are learned.
+- The `tanh`-softcap (±15) squashes extreme logits but introduces a non-uniform prior over the vocabulary even when the model has learned nothing.
+- `wte` is initialised with `std = 5/√n_embd` (≈ 0.22 for n_embd=512) giving logit std ≈ 5 at step 0. This is intentionally below the softcap boundary of 15 but not zero, so the softmax is not perfectly flat.
+
+The gap between observed step-0 loss and the entropy ceiling closes within the first few steps as the model learns a calibrated output distribution. A step-0 loss above the entropy ceiling indicates the model starts confidently wrong rather than maximally uncertain; it is acceptable as long as it falls toward random baseline within ~10 steps.
 
 ---
 
@@ -201,5 +250,22 @@ LR schedule: flat → warmdown over last 50% of budget, cosine to 0.
 |--------|---------|--------|
 | `PC_WEIGHT` | 0.1 | Scales total `aux_loss` contribution to the gradient |
 | `pc_focal_gamma` | 1.0 | Exponent for output-difficulty weighting of `pc_loss` (0 = uniform) |
-| `kl_weight` | 0.01 | Scales the KL divergence loss from stochastic layers |
+| `kl_weight` | 0.01 | Scales the KL divergence loss from stochastic layers; linearly ramped from 0 over first 200 steps |
 | `pc_scale` | √512 ≈ 22.6 | Fixed denominator making prediction errors dimensionless (Bogacz 2017) |
+
+---
+
+## Environment Variables
+
+These are read once at launch and affect training setup or behavior without changing the compiled graph.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PC_WEIGHT` | `0.1` | Weight applied to `aux_loss` in the training loop |
+| `PC_FOCAL_GAMMA` | `1.0` | Output-difficulty focal exponent (0 = uniform) |
+| `KL_WEIGHT` | `0.01` | Final KL weight after warmup |
+| `PC_HEAD_DIM` | `max(64, DEPTH*ASPECT_RATIO//8)` | Bottleneck dimension for PC prediction heads |
+| `PC_DIAG_INTERVAL` | `50` | Steps between PC diagnostic prints (0 = off) |
+| `RESUME_CHECKPOINT` | `""` | Path to a `checkpoint.pt` to resume from; restores model weights, optimizer state, `step`, and `total_training_time` |
+| `VAL_INTERVAL` | `0` | Steps between mid-training `evaluate_bpb` calls (0 = disabled) |
+| `TRAIN_TIME_BUDGET` | `360` | Training wall-clock budget in seconds |
