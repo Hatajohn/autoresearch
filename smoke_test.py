@@ -612,9 +612,8 @@ def test_grad_norm_and_checkpoint():
     # (Tested indirectly below via the EMA update check.)
 
     # ── pc_ema update: buffer transitions from zero to non-zero after one step ─
-    # Mirrors the training loop:
-    #   model.pc_ema.mul_(PC_EMA_DECAY).add_(_last_layer_means, alpha=1-PC_EMA_DECAY)
-    # Use a fresh model so we start from the known zero-init state.
+    # Mirrors the training loop (train.py): new_ema = pc_ema*decay + layer_means*(1-decay);
+    # then pc_ema.data.copy_(new_ema) to avoid version-counter bump and per-step recompile.
     ema_decay = _tr.PC_EMA_DECAY
     ema_alpha = 1.0 - ema_decay
     model3, _ = _make_model_and_opt()
@@ -628,7 +627,8 @@ def test_grad_norm_and_checkpoint():
     assert _m3_means.dtype == torch.float32, \
         f"layer_means dtype {_m3_means.dtype} should be float32"
     with torch.no_grad():
-        model3.pc_ema.mul_(ema_decay).add_(_m3_means, alpha=ema_alpha)
+        new_ema = model3.pc_ema * ema_decay + _m3_means * ema_alpha
+        model3.pc_ema.data.copy_(new_ema)
     # After one EMA step from zero: pc_ema = 0*decay + alpha*layer_means = alpha*layer_means
     assert not (model3.pc_ema == 0).all(), \
         "pc_ema still all-zero after EMA update — training loop will feed static-zero targets"
