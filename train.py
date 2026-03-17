@@ -1110,8 +1110,14 @@ if __name__ == "__main__":
         optimizer.step()
         model.zero_grad(set_to_none=True)
         # Update PC EMA target buffer outside the compiled graph (buffer is read-only inside forward).
+        # Use .data.copy_() instead of in-place ops (.mul_/.add_) to avoid incrementing the buffer's
+        # version counter.  In-place mutation causes torch.compile to invalidate the cached graph on
+        # the next forward call, triggering a full Triton recompile every step (run 21 root cause:
+        # 200–440 s/step instead of ~65 s).  .data.copy_() writes to storage directly, bypassing the
+        # autograd version machinery, so the guard sees an unchanged version and reuses the cache.
         with torch.no_grad():
-            model.pc_ema.mul_(PC_EMA_DECAY).add_(_last_layer_means, alpha=1.0 - PC_EMA_DECAY)
+            new_ema = model.pc_ema * PC_EMA_DECAY + _last_layer_means * (1.0 - PC_EMA_DECAY)
+            model.pc_ema.data.copy_(new_ema)
 
         train_loss_f = train_loss.item()
         train_pc_loss_f = train_pc_loss.item()
