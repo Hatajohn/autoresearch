@@ -651,7 +651,7 @@ class GPT(nn.Module):
         final_normed  = normed_outs[-1]                                                                          # reuse; avoids a redundant norm() call
         h_stack       = torch.stack(normed_outs[:L])                                                             # (L, B, T, C) — predictors
         # EMA target: broadcast (L, C) → (L, B, T, C).  Cast to match h_stack dtype (bfloat16 under autocast).
-        ema_target    = self.pc_ema.to(dtype=h_stack.dtype).unsqueeze(1).unsqueeze(1).expand(L, B, T, C)        # (L, B, T, C) — stationary targets
+        ema_target    = self.pc_ema.to(dtype=h_stack.dtype).unsqueeze(1).unsqueeze(1).expand_as(h_stack)        # (L, B, T, C) — stationary targets
 
         # Residual pred_head: pred = h + proj(tanh(fc(h)))
         fc_out  = torch.einsum('lbtc,ldc->lbtd', h_stack, self.pc_fc_w[:L])              # (L, B, T, pc_head_dim)

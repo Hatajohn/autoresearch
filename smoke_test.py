@@ -342,6 +342,23 @@ def test_model_invariants():
     assert lls_id in all_opt_param_ids, \
         "lm_head_log_scale not found in any optimizer param group"
 
+    # ── pc_ema: persistent EMA buffer for PC targets ─────────────────────────
+    assert hasattr(model, 'pc_ema'), "GPT is missing 'pc_ema' buffer"
+    expected_ema_shape = (config.n_layer - 1, config.n_embd)
+    assert model.pc_ema.shape == expected_ema_shape, (
+        f"pc_ema shape {model.pc_ema.shape} != {expected_ema_shape}"
+    )
+    assert model.pc_ema.dtype == torch.float32, \
+        f"pc_ema dtype {model.pc_ema.dtype} should be float32"
+    assert (model.pc_ema == 0).all(), \
+        "pc_ema should be zero-initialised"
+    # Must be persistent so it survives checkpoint round-trips
+    assert 'pc_ema' in dict(model.named_buffers()), \
+        "pc_ema not found in model.named_buffers()"
+    # Persistent buffers appear in state_dict; non-persistent ones do not
+    assert 'pc_ema' in model.state_dict(), \
+        "pc_ema not in model.state_dict() — must be persistent=True"
+
     # ── get_pc_diagnostics() includes sigma_bias_exp ─────────────────────────
     diag = model.get_pc_diagnostics()
     assert "sigma_bias_exp" in diag, \
@@ -451,6 +468,27 @@ def test_forward_numerics():
         "loss is Inf with extreme negative resid_lambdas"
     with torch.no_grad():
         model.resid_lambdas.fill_(math.log(math.e - 1))   # restore
+
+    # ── reduction='none' returns a 2-tuple (not 3) ───────────────────────────
+    # forward(x, y, reduction='none') is used by evaluate_bpb and the eval
+    # pre-warm block.  It must NOT return layer_means (graph would break).
+    model.zero_grad()
+    with AUTOCAST:
+        none_out = model(x, y, reduction='none')
+    assert len(none_out) == 2, (
+        f"model(x, y, reduction='none') should return 2-tuple "
+        f"(token_ce, aux_loss), got {len(none_out)}-tuple"
+    )
+    token_ce, aux_none = none_out
+    assert token_ce.shape == (x.shape[0], x.shape[1]), (
+        f"token_ce shape {token_ce.shape} != (B={x.shape[0]}, T={x.shape[1]})"
+    )
+
+    # ── PC_WEIGHT_WARMUP removed from training loop ───────────────────────────
+    # Run 20 confirmed warmup is counterproductive; the constant was deleted.
+    import train as _tr
+    assert not hasattr(_tr, 'PC_WEIGHT_WARMUP'), \
+        "PC_WEIGHT_WARMUP still present — warmup removal not applied"
 
     # ── Step 9: pc_head_dim bottleneck — verify intermediate shape ───────────
     # The shapes are implicit in the parameters; verify via param shapes
@@ -562,6 +600,29 @@ def test_grad_norm_and_checkpoint():
             f"Weight mismatch after resume: {key}"
 
     os.unlink(ckpt_path)
+
+    # ── pc_ema update: buffer transitions from zero to non-zero after one step ─
+    # Mirrors the training loop: model.pc_ema.mul_(0.99).add_(layer_means, alpha=0.01)
+    # Use a fresh model so we start from the known zero-init state.
+    model3, _ = _make_model_and_opt()
+    assert (model3.pc_ema == 0).all(), "pc_ema not zero at init in fresh model"
+    x3 = torch.randint(0, config.vocab_size, (2, 32), device=DEVICE)
+    y3 = torch.randint(0, config.vocab_size, (2, 32), device=DEVICE)
+    with autocast_ctx:
+        _m3_loss, _m3_aux, _m3_means = model3(x3, y3)
+    assert _m3_means.shape == (config.n_layer - 1, config.n_embd), \
+        f"layer_means shape {_m3_means.shape} != ({config.n_layer-1}, {config.n_embd})"
+    assert _m3_means.dtype == torch.float32, \
+        f"layer_means dtype {_m3_means.dtype} should be float32"
+    with torch.no_grad():
+        model3.pc_ema.mul_(0.99).add_(_m3_means, alpha=0.01)
+    # After one EMA step from zero: pc_ema = 0*0.99 + 0.01*layer_means = 0.01*layer_means
+    assert not (model3.pc_ema == 0).all(), \
+        "pc_ema still all-zero after EMA update — training loop will feed static-zero targets"
+    expected_ema = 0.01 * _m3_means
+    assert torch.allclose(model3.pc_ema, expected_ema, atol=1e-6), \
+        "pc_ema after first step != 0.01 * layer_means (EMA formula broken)"
+
     _dynamo.config.cache_size_limit = _orig_cache_limit
 
     print(
