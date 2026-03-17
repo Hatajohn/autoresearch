@@ -70,6 +70,7 @@ Runs 16–20 all showed pc_loss oscillating over multiple orders of magnitude du
 | 20 | 4,348 | PC_WEIGHT_WARMUP=50 (made it worse — see below) |
 | 21 | ~1,048 | EMA target buffer, PC_WEIGHT=0.02 — **cold cache; only 4 steps, inconclusive** |
 | 22 | ~3,490 | pc_ema update via .data.copy_(); **43 steps, val_bpb 3.072**; pc_loss stabilizes after ~25 |
+| 23 | N/A (PC_WEIGHT=0) | **Baseline ablation** — same config as 22, PC_WEIGHT=0. Compare val_bpb to 3.072. *Pending.* |
 
 **PC_WEIGHT_WARMUP was counterproductive** (run 20): shielding the backbone from PC pressure during early steps let it develop CE-optimal representations that were maximally *unpredictable* inter-layer. When the PC gradient ramped in, it found a harder target than without warmup, producing a higher pc_loss peak (4,348 vs 575). Warmup removed in run 21.
 

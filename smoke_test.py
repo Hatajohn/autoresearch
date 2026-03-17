@@ -26,13 +26,15 @@ Smoke test for train.py.  Six tests, increasing in fidelity:
 
   Test 4 — FORWARD NUMERICS (Steps 2, 3 stress, 9)
     Forward+backward numeric validation:
+      - model(x) with no targets returns logits (B, T, vocab_size) for step-0 diagnostic path
       - KL divergence computed in float32 (hook-verified)
       - No NaN under extreme negative resid_lambdas
-      - pc_head_dim bottleneck einsums produce correct output shapes
+      - reduction='none' returns 2-tuple; pc_head_dim bottleneck einsums correct shapes
 
   Test 5 — GRAD NORM + CHECKPOINT RESUME (Steps 5, 6)
     Optimizer-level checks:
       - clip_grad_norm_ returns a finite, positive grad_norm
+      - Checkpoint includes pc_ema so resume restores EMA targets
       - Checkpoint save/load restores model weights, optimizer state, step,
         and total_training_time exactly
 
@@ -40,9 +42,20 @@ Smoke test for train.py.  Six tests, increasing in fidelity:
     Simulates steps 0–5 with VAL_INTERVAL=3 and a mocked evaluate_bpb.
     Asserts evaluate_bpb fires exactly once (at step 3), never at step 0.
 
+  Test 7 — PREPARE CONTRACT (--integration only)
+    With cache: tokenizer loads, make_dataloader yields one batch (shapes,
+    dtype, token id range), and model(x, y, reduction='none') returns 2-tuple.
+    Skips if cache missing. Full evaluate_bpb() not run (too many steps).
+
+  Test 8 — TRAINING LOOP SMOKE (--integration only)
+    Subprocess run of train.py with TRAIN_TIME_BUDGET=45. Default subprocess
+    timeout 1800s (cold compile+pre-warm can exceed 20 min). Override with
+    env SMOKE_TEST8_TIMEOUT=seconds. Asserts exit 0 and "step" in output.
+
 Usage:
-  python smoke_test.py              # run all five tests
-  python smoke_test.py --no-compile # skip Test 2 (faster, e.g. in CI)
+  python smoke_test.py                  # run core tests (1, 3, 4, 5, 6, 6b, 2)
+  python smoke_test.py --no-compile    # skip Test 2 (faster, e.g. in CI)
+  python smoke_test.py --integration   # also run Test 7 (prepare) and Test 8 (train loop)
 """
 
 import math
@@ -389,6 +402,16 @@ def test_model_invariants():
         f"(n_layer×2 + 1 for lm_head_log_scale), got {counts['scalars']}"
     )
 
+    # ── Train loop env vars present and typed ─────────────────────────────────
+    assert hasattr(_train_module, 'TIME_BUDGET'), "train module missing TIME_BUDGET"
+    assert isinstance(_train_module.TIME_BUDGET, int), \
+        f"TIME_BUDGET must be int, got {type(_train_module.TIME_BUDGET)}"
+    assert _train_module.TIME_BUDGET > 0, "TIME_BUDGET must be positive"
+    assert hasattr(_train_module, 'VAL_INTERVAL'), "train module missing VAL_INTERVAL"
+    assert isinstance(_train_module.VAL_INTERVAL, int), \
+        f"VAL_INTERVAL must be int, got {type(_train_module.VAL_INTERVAL)}"
+    assert _train_module.VAL_INTERVAL >= 0, "VAL_INTERVAL must be non-negative"
+
     print(f"{PASS}")
 
 
@@ -440,6 +463,35 @@ def test_forward_numerics():
     assert_finite(main_loss, "main_loss (forward_numerics)")
     assert_finite(aux_loss,  "aux_loss  (forward_numerics)")
 
+    # ── StochasticLayer grads: KL path must produce non-zero gradients ───────
+    stoch_params_with_grad = [
+        p for sl in model.stochastic_layers
+        if isinstance(sl, StochasticLayer)
+        for p in sl.parameters()
+        if p.grad is not None and p.grad.abs().sum().item() > 1e-10
+    ]
+    assert len(stoch_params_with_grad) > 0, (
+        "StochasticLayer parameters received no gradients after backward; "
+        "KL path may be detached or broken"
+    )
+
+    # ── Determinism: same seed, two forwards in eval mode → same loss ──────────
+    model.eval()
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
+    with torch.no_grad():
+        with AUTOCAST:
+            _loss_a = model(x, y)[0].item()
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
+    with torch.no_grad():
+        with AUTOCAST:
+            _loss_b = model(x, y)[0].item()
+    assert math.isclose(_loss_a, _loss_b, rel_tol=1e-5), (
+        f"Determinism broken: two forwards gave {_loss_a} vs {_loss_b}"
+    )
+    model.train()
+
     # ── wte_std init: target logit_std ≈ 1.75 so E[CE] ≈ 10.5 nats at step 0 ─
     # wte_std = 1.75/sqrt(n_embd); verify the embedding weight std matches.
     expected_wte_std = 1.75 / (config.n_embd ** 0.5)
@@ -468,6 +520,17 @@ def test_forward_numerics():
         "loss is Inf with extreme negative resid_lambdas"
     with torch.no_grad():
         model.resid_lambdas.fill_(math.log(math.e - 1))   # restore
+
+    # ── forward(x) no targets: returns logits for step-0 diagnostic path ─────
+    with torch.no_grad():
+        with AUTOCAST:
+            logits_only = model(x)
+    assert isinstance(logits_only, torch.Tensor), \
+        "model(x) with no targets should return logits tensor, not a tuple"
+    assert logits_only.shape == (x.shape[0], x.shape[1], config.vocab_size), (
+        f"logits shape {logits_only.shape} != (B={x.shape[0]}, T={x.shape[1]}, V={config.vocab_size})"
+    )
+    assert logits_only.isfinite().all(), "logits from model(x) contain NaN/Inf"
 
     # ── reduction='none' returns a 2-tuple (not 3) ───────────────────────────
     # forward(x, y, reduction='none') is used by evaluate_bpb and the eval
@@ -574,6 +637,10 @@ def test_grad_norm_and_checkpoint():
     with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
         ckpt_path = f.name
     torch.save(ckpt_state, ckpt_path)
+
+    # Checkpoint must include pc_ema so resumed training has correct EMA targets.
+    assert "pc_ema" in ckpt_state["model"], \
+        "Checkpoint state_dict missing 'pc_ema' — resume would reinit EMA to zero"
 
     # Build a fresh model + optimizer and resume (mirrors __main__ RESUME_CHECKPOINT block)
     model2, optimizer2 = _make_model_and_opt()
@@ -725,6 +792,118 @@ def test_val_interval_fires():
 
 
 # ---------------------------------------------------------------------------
+# Test 7 — prepare contract (--integration only; requires cache)
+# ---------------------------------------------------------------------------
+def test_prepare_contract():
+    """
+    With --integration and cache present: tokenizer loads, make_dataloader yields
+    one batch with correct shapes and value range, and a model with matching
+    vocab accepts the batch and returns the 2-tuple expected by evaluate_bpb.
+    Full evaluate_bpb() is not run (too many steps); the contract is that
+    prepare's API and model(x, y, reduction='none') stay aligned.
+    """
+    print("Test 7  [prepare contract]  ...", end="  ", flush=True)
+
+    try:
+        from prepare import Tokenizer, make_dataloader, MAX_SEQ_LEN
+    except ImportError as e:
+        print(f"SKIP  prepare import failed: {e}")
+        return
+
+    try:
+        tokenizer = Tokenizer.from_directory()
+    except (FileNotFoundError, OSError) as e:
+        print(f"SKIP  cache missing ({e}); run prepare.py and use --integration")
+        return
+
+    vocab_size = tokenizer.get_vocab_size()
+    assert vocab_size > 0, "tokenizer vocab size should be positive"
+
+    # One batch from val loader (short T so we don't need full MAX_SEQ_LEN model)
+    batch_T = 128
+    try:
+        val_loader = make_dataloader(tokenizer, B=2, T=batch_T, split="val")
+        x_batch, y_batch, epoch = next(val_loader)
+    except (FileNotFoundError, OSError, AssertionError) as e:
+        print(f"SKIP  val data missing or empty ({e})")
+        return
+
+    assert x_batch.shape == (2, batch_T), f"x batch shape {x_batch.shape} != (2, {batch_T})"
+    assert y_batch.shape == (2, batch_T), f"y batch shape {y_batch.shape} != (2, {batch_T})"
+    assert x_batch.dtype == torch.long and y_batch.dtype == torch.long
+    assert (x_batch >= 0).all() and (x_batch < vocab_size).all(), "x token ids out of range"
+    assert (y_batch >= 0).all() and (y_batch < vocab_size).all(), "y token ids out of range"
+
+    # Model with matching vocab and seq_len >= batch_T
+    config = GPTConfig(
+        sequence_len=256, vocab_size=vocab_size,
+        n_layer=4, n_head=2, n_kv_head=2, n_embd=128,
+        window_pattern="PROGRESSIVE", pc_head_dim=16,
+    )
+    model = _build_model(config)
+    model.eval()
+    with torch.no_grad():
+        with AUTOCAST:
+            out = model(x_batch.to(DEVICE), y_batch.to(DEVICE), reduction='none')
+    assert len(out) == 2, f"model(..., reduction='none') must return 2-tuple, got {len(out)}"
+    token_ce, aux = out
+    assert token_ce.shape == (2, batch_T), f"token_ce shape {token_ce.shape} != (2, {batch_T})"
+    assert token_ce.isfinite().all(), "token_ce contained NaN/Inf"
+    model.train()
+
+    print(f"{PASS}  tokenizer+batch+model contract OK")
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — training loop smoke (--integration only; slow)
+# ---------------------------------------------------------------------------
+def test_training_loop_smoke():
+    """
+    With --integration: run train.py in a subprocess with TRAIN_TIME_BUDGET=45s.
+    Subprocess timeout defaults to 1800s so cold Triton compile + kernel pre-warm
+    (often 10–25 min on first graph) can finish. Set SMOKE_TEST8_TIMEOUT to override.
+    """
+    print("Test 8  [training loop smoke]  ...", end="  ", flush=True)
+    import subprocess
+
+    # 90s was too tight: pre-warm alone can be 1200s+ on cold cache (see run21 logs).
+    timeout_s = int(os.environ.get("SMOKE_TEST8_TIMEOUT", "1800"))
+
+    env = os.environ.copy()
+    env["TRAIN_TIME_BUDGET"] = "45"   # short run; enough for 1–2 steps after pre-warm
+    env["VAL_INTERVAL"] = "0"
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "train.py")],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            cwd=os.path.dirname(__file__),
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"{FAIL}  train.py did not complete within {timeout_s}s "
+            f"(cold compile/pre-warm can be slow; set SMOKE_TEST8_TIMEOUT higher, "
+            f"or run once to warm the cache)"
+        )
+        raise
+    except FileNotFoundError as e:
+        print(f"SKIP  {e}")
+        return
+
+    assert proc.returncode == 0, (
+        f"train.py exited {proc.returncode}\nstderr: {proc.stderr[:500] if proc.stderr else 'none'}"
+    )
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    assert "step" in combined.lower(), (
+        "train.py output did not contain 'step'; loop may not have run\n"
+        f"stdout tail: {(proc.stdout or '')[-800:]}"
+    )
+    print(f"{PASS}  train.py completed with steps")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def _check_no_training_running():
@@ -793,6 +972,7 @@ def _check_no_training_running():
 
 if __name__ == "__main__":
     no_compile = "--no-compile" in _smoke_args
+    integration = "--integration" in _smoke_args
 
     _check_no_training_running()
 
@@ -824,5 +1004,13 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"{FAIL}  {e}")
             sys.exit(1)
+
+    if integration:
+        for name, fn in [("Test 7", test_prepare_contract), ("Test 8", test_training_loop_smoke)]:
+            try:
+                fn()
+            except Exception as e:
+                print(f"{FAIL}  {e}")
+                sys.exit(1)
 
     print("\nAll smoke tests passed.")

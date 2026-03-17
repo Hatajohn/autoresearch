@@ -74,6 +74,8 @@ RESUME_CHECKPOINT=checkpoint.pt TRAIN_TIME_BUDGET=1800 uv run train.py 2>&1 | te
 | `PC_DIAG_INTERVAL` | `50` | Print PC diagnostics every this many steps (`0` = off). |
 | `KL_WEIGHT` | `0.01` | Weight for stochastic-layer KL loss. |
 | `LOG_MIN_WINDOW` | `0` | Override minimum attention window (power of 2, ≥ 16; `0` = auto). |
+| `USE_TORCH_COMPILE` | `1` | `1`/`full` = whole-model compile (fastest steps, long cold start). `regional` = per–transformer-block compile ([PyTorch recipe](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)) — shorter cold start. `0` = off. **Resume with the same mode the checkpoint used** (state_dict layout differs). |
+| `USE_STOCHASTIC_LAYERS` | `1` | Set `0` to disable stochastic layers (no KL from them). |
 
 Checkpoint and config are defined in `train.py`; the default checkpoint path is `checkpoint.pt` in the current directory. At the end of a run the script prints a short summary including `val_bpb` and saves the model state to that path.
 

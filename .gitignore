@@ -21,3 +21,26 @@ dev/
 
 # Results file
 results.tsv
+
+# Personal research notes
+docs/open_questions.md
+
+# Run artifacts (local logs and reports)
+sessions/
+reports/
+
+# Checkpoints (large, machine-specific; do not push)
+checkpoint.pt
+checkpoint_*.pt
+
+# Current run log
+run.log
+
+# Editor/IDE
+.cursor/
+
+# Local references (PDFs etc.)
+papers/
+
+# Stub; real file is docs/trainer_notes.md
+trainer_notes.md

@@ -26,7 +26,7 @@ flowchart TD
         MLP_N --> STOCH --> layer_outs
     end
 
-    subgraph PHASE2["Phase 2  hierarchical PC  after all layers"]
+    subgraph PHASE2["Phase 2  hierarchical PC  after all layers  (only when reduction='mean'; eval skips)"]
         EMA["pc_ema[i]  shape (n_layer-1, n_embd)\nEMA of norm(layer_outs[i+1])  decay=0.99\nupdated outside compiled graph each step"]
         PRED["residual bottleneck pred head\npred = h + proj(tanh(fc(h)))\n(L, B, T, pc_head_dim=64) -> (L, B, T, 512)"]
         ERR["raw_error = (ema_target - pred) / pc_scale\nema_target = pc_ema broadcast to (L, B, T, C)"]
@@ -86,6 +86,97 @@ flowchart TD
     class CE,AUX,FOCAL,PCLOSS  loss
     class TOTAL          total
 ```
+
+---
+
+## Mathematical equations (from train.py)
+
+The following definitions match the implementation. Batch size \(B\), sequence length \(T\), embedding dimension \(C = n\_embd\), number of layers \(n\).
+
+### Normalisation and residual scale
+
+- **RMSNorm** (applied to Q, K, and to layer inputs before attn/MLP):
+  \[
+  \mathrm{norm}(x) = \frac{x}{\sqrt{\frac{1}{C}\sum_{c=1}^C x_c^2 + \epsilon}}
+  \]
+
+- **Per-layer residual scale** (before each block):
+  \[
+  \lambda_i = \mathrm{softplus}(\mathtt{resid\_lambdas}[i]), \qquad x \leftarrow \lambda_i \cdot x
+  \]
+
+### Block (attention + MLP)
+
+- **Pre-norm residual block**:
+  \[
+  x \leftarrow x + \mathrm{Attn}(\mathrm{norm}(x)); \qquad x \leftarrow x + \mathrm{MLP}(\mathrm{norm}(x))
+  \]
+
+- **Attention**: \(Q = W_q x\), \(K = W_k x\), \(V = W_v x\). Value residual (when VE present): \(v \leftarrow v + 2\,\sigma(W_{ve}(x_{1:vgc})) \odot \mathrm{VE}(\mathrm{idx})\). RoPE on \(Q,K\); then \(\tilde{Q},\tilde{K} = \mathrm{norm}(\mathrm{RoPE}(Q)), \mathrm{norm}(\mathrm{RoPE}(K))\); temperature \(\beta = (\mathtt{attn\_temp}^2 + 0.01)\); \(\tilde{Q} \leftarrow \beta \cdot \tilde{Q}\). Causal (and optional window) masked softmax attention: \(\mathrm{Attn}(x) = W_o\,\mathrm{Attention}(\tilde{Q}, \tilde{K}, V)\).
+
+- **MLP** (ReLU²):
+  \[
+  \mathrm{MLP}(x) = W_2\,\bigl(\mathrm{ReLU}(W_1 x)\bigr)^2
+  \]
+
+### StochasticLayer (layers 2, 5, …)
+
+- **Reparameterisation**: \(\mu = W_\mu x\), \(\log\sigma = \mathrm{clamp}(W_\sigma x, -6, 2)\), \(\sigma = \exp(\log\sigma)\). Training: \(z = \mu + \xi \cdot \sigma \odot \varepsilon\), \(\varepsilon \sim \mathcal{N}(0,I)\); eval: \(z = \mu\).
+- **KL** (in float32):
+  \[
+  \mathrm{KL}(q\,\|\, \mathcal{N}(0,1)) = \frac{1}{2}\bigl(\sigma^2 + \mu^2 - 2\log\sigma - 1\bigr), \qquad \mathtt{kl} = \mathrm{mean}(\mathrm{KL})
+  \]
+
+### TemporalSummarizer (layers n//3, 2n//3)
+
+- Causal depthwise Conv1d (kernel size 4) then linear proj; residual: \(x \leftarrow x + \mathrm{proj}(\mathrm{conv}(x))\); sequence length unchanged.
+
+### Phase 2: hierarchical PC
+
+Phase 2 (PC stack, EMA target, pred head, gate, pc_loss_map) runs only when `reduction=='mean'` (training). When `reduction=='none'` (e.g. `evaluate_bpb`), this block is skipped and `pc_loss` is zero.
+
+- **Predictor stack and EMA target**: \(L = n-1\). \(\hat{h}_i = \mathrm{norm}(\mathrm{layer\_outs}[i])\) for \(i=0..n-1\). \(h = [\hat{h}_0,\ldots,\hat{h}_{L-1}]\) stacked → \((L,B,T,C)\). EMA target (read-only in forward): \(\mathtt{ema\_target} = \mathtt{pc\_ema}\) broadcast from \((L,C)\) to \((L,B,T,C)\) (same dtype as \(h\)).
+
+- **Prediction head** (residual bottleneck, per layer \(i\)):
+  \[
+  \mathrm{pred}_i = h_i + W_{\mathrm{proj},i}^\top\,\tanh(W_{\mathrm{fc},i}\, h_i)
+  \]
+  with \(W_{\mathrm{fc},i} \in \mathbb{R}^{d_h \times C}\), \(W_{\mathrm{proj},i} \in \mathbb{R}^{d_h \times C}\), \(d_h = \mathtt{pc\_head\_dim}\).
+
+- **Scaled prediction error** (Bogacz 2017): \(\mathtt{pc\_scale} = \sqrt{C}\).
+  \[
+  e_i = \frac{\mathtt{ema\_target}_i - \mathrm{pred}_i}{\mathtt{pc\_scale}}, \qquad
+  \mathtt{token\_pc}_i = \mathrm{softplus}(\mathtt{pc\_log\_lambdas}[i]) \cdot \frac{1}{C}\sum_c e_{i,c}^2
+  \]
+
+- **Routing gate** (on detached \(h\)):
+  \[
+  g_i = \sigma\bigl( h_i.detach() \cdot w_{\mathrm{gate},i} + b_{\mathrm{gate},i} \bigr), \qquad
+  \mathtt{pc\_loss\_map} = \sum_{i=0}^{L-1} g_i \odot \mathtt{token\_pc}_i \quad \in \mathbb{R}^{B \times T}
+  \]
+
+- **Focal weighting and PC loss**: \(\mathtt{token\_ce}\) = per-token cross-entropy (B,T). Difficulty (detached): \(\mathtt{difficulty} = \bigl(\mathtt{token\_ce} / (\mathrm{mean}(\mathtt{token\_ce}) + 10^{-6})\bigr)^\gamma\). Then
+  \[
+  \mathtt{pc\_loss} = \frac{1}{L}\,\mathrm{mean}\bigl(\mathtt{pc\_loss\_map} \odot \mathtt{difficulty}\bigr), \qquad
+  \mathtt{aux\_loss} = \mathtt{pc\_loss} + \mathtt{kl\_weight} \cdot \mathtt{kl\_loss}
+  \]
+
+- **Layer means for EMA update** (returned from forward when `reduction='mean'`):
+  \[
+  \mathtt{layer\_means}[i] = \mathrm{mean}_{b,t}\Bigl(\mathrm{norm}(\mathrm{layer\_outs}[i+1])_{b,t}\Bigr) \in \mathbb{R}^C
+  \]
+  Updated in the training loop (outside the compiled graph): \(\mathtt{pc\_ema} \leftarrow \rho\,\mathtt{pc\_ema} + (1-\rho)\,\mathtt{layer\_means}\) with \(\rho = \mathtt{PC\_EMA\_DECAY}\) (default 0.99).
+
+### Output and loss
+
+- **Logits**: \(x = \hat{h}_{n-1}\); \(\mathtt{logits} = \mathtt{softcap} \cdot \tanh\bigl(W_{\mathrm{lm}}\,x \cdot \exp(\mathtt{lm\_head\_log\_scale}) / \mathtt{softcap}\bigr)\) with \(\mathtt{softcap} = 15\).
+
+- **Main loss**: \(\mathcal{L}_{\mathrm{main}} = \mathrm{mean}(\mathtt{token\_ce}) + 0.15\,\mathcal{L}_{t+2} + 0.05\,\mathcal{L}_{t+4}\) (aux horizons 2 and 4 with dedicated heads).
+
+- **Total loss**:
+  \[
+  \mathcal{L} = \mathcal{L}_{\mathrm{main}} + \mathtt{PC\_WEIGHT} \cdot \mathtt{aux\_loss}
+  \]
 
 ---
 
