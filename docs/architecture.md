@@ -27,18 +27,18 @@ flowchart TD
     end
 
     subgraph PHASE2["Phase 2  hierarchical PC  after all layers"]
-        TARGETS["targets_stack[i] = norm(layer_outs[i+1]).detach()\nlayer i predicts its immediate neighbour\n(L, B, T, C)  — upper layer detached"]
+        EMA["pc_ema[i]  shape (n_layer-1, n_embd)\nEMA of norm(layer_outs[i+1])  decay=0.99\nupdated outside compiled graph each step"]
         PRED["residual bottleneck pred head\npred = h + proj(tanh(fc(h)))\n(L, B, T, pc_head_dim=64) -> (L, B, T, 512)"]
-        ERR["raw_error = (targets_stack - pred) / pc_scale"]
+        ERR["raw_error = (ema_target - pred) / pc_scale\nema_target = pc_ema broadcast to (L, B, T, C)"]
         PCWEIGHT["pc_w = softplus(pc_log_lambdas[i])\ntoken_pc = pc_w * mean(raw_error^2, dim=C)"]
         GATE["learned routing gate  per-layer\nsigmoid(h.detach() @ pc_gate_w + pc_gate_b)  (L, B, T)\nh detached — backbone cannot null the gate"]
         PCLOSS_A["pc_loss_map = sum_L(gate * token_pc)  (B, T)\ngradient flows back to each layer's params"]
-        TARGETS --> PRED --> ERR --> PCWEIGHT --> PCLOSS_A
+        EMA --> PRED --> ERR --> PCWEIGHT --> PCLOSS_A
         ERR --> GATE --> PCLOSS_A
     end
 
     N0 --> SCALE
-    layer_outs --> TARGETS
+    layer_outs --> EMA
     layer_outs --> OUTNORM
 
     OUTNORM["RMSNorm"]
@@ -159,7 +159,15 @@ flowchart LR
     class L1,L2,L3,L4,L5,L6,L7  target
 ```
 
-Each layer predicts its immediate neighbour: layer i predicts `norm(layer_outs[i+1]).detach()`. This restores the classical PC hierarchy — each level only needs to account for the representational shift introduced by the next layer, not the full transformation from local features to global context. The upper layer target is always detached so gradient flows only into the predictor, not the target.
+Each layer predicts its immediate neighbour. The target for layer i is a per-layer exponential moving average of `norm(layer_outs[i+1])` across recent training steps, stored in the `pc_ema` buffer (shape `n_layer-1, n_embd`):
+
+```
+pc_ema[i] ← 0.99 · pc_ema[i] + 0.01 · norm(layer_outs[i+1]).mean(B, T)
+```
+
+The EMA is updated in the training loop **outside** the compiled graph (so `forward()` treats it as read-only, preserving `fullgraph=True`). Inside `forward()`, the EMA is broadcast from `(L, C)` to `(L, B, T, C)` and used directly as `ema_target`.
+
+**Why EMA instead of instantaneous targets**: runs 19–20 showed that using `norm(layer_outs[i+1]).detach()` directly caused pc_loss to oscillate over four orders of magnitude (0→4348) because the PC heads chased a target moving at the speed of the backbone's CE gradient. The EMA (~100-step time constant) decouples target velocity from backbone learning rate, allowing PC head gradients to accumulate coherently.
 
 ---
 
@@ -194,6 +202,8 @@ Both are batched over the layer dimension via einsum, so Phase 2 is a single ker
 Both `pc_fc_w` and `pc_proj_w` are zero-initialised so `pred = h` (identity residual) at step 0 and both weights grow together from the first gradient step, avoiding a discontinuous jump in prediction error.
 
 `pc_head_dim` defaults to `max(64, DEPTH * ASPECT_RATIO // 8)` = 64 and is sweepable via `PC_HEAD_DIM`.
+
+**EMA target buffer** (`pc_ema`): a persistent buffer of shape `(n_layer-1, n_embd)` storing the exponentially smoothed per-layer mean representation. Zero-initialised; updated outside the compiled graph after each optimizer step. The PC heads predict this slowly-moving target rather than the instantaneous backbone output.
 
 The routing gate is a learned linear probe on a **detached** copy of the hidden state:
 
@@ -234,13 +244,13 @@ LR schedule: flat → warmdown over last 50% of budget, cosine to 0.
 
 Random-init lower bound: `ln(vocab_size)` = `ln(8192)` ≈ **9.01 nats**.
 
-Step-0 loss is typically **10–11 nats**, above this ceiling. This is expected and not a bug:
+Target step-0 loss: **~10.5 nats** (confirmed by smoke test: ≈10.80).
 
-- `resid_lambdas` are initialised so `softplus(x) = 1.0`, but they are free parameters and can drift above 1 early in training, amplifying activations and making the distribution non-uniform before any useful features are learned.
-- The `tanh`-softcap (±15) squashes extreme logits but introduces a non-uniform prior over the vocabulary even when the model has learned nothing.
-- `wte` is initialised with `std = 5/√n_embd` (≈ 0.22 for n_embd=512) giving logit std ≈ 5 at step 0. This is intentionally below the softcap boundary of 15 but not zero, so the softmax is not perfectly flat.
+`wte` is initialised with `std = 1.75/√n_embd` (≈ 0.077 for n_embd=512), giving logit std ≈ 1.75 at step 0. Expected CE ≈ ln(8192) + σ²/2 ≈ 9.01 + 1.53 ≈ **10.54 nats**. A pre-warm step-0 diagnostic prints `logit_std` and `raw_CE` to confirm production matches the smoke test.
 
-The gap between observed step-0 loss and the entropy ceiling closes within the first few steps as the model learns a calibrated output distribution. A step-0 loss above the entropy ceiling indicates the model starts confidently wrong rather than maximally uncertain; it is acceptable as long as it falls toward random baseline within ~10 steps.
+The production step-0 loss as reported by the EMA-smoothed training metric is typically higher than the raw diagnostic (≈16 nats in run 20 vs raw ≈10.5). This is because the EMA-debiased loss includes aux_lm_head contributions and accumulates the large gradient spike from step 1 into the smoothed value. The raw CE diagnostic is the reliable number.
+
+**Previous init** (`5.0/√n_embd`, runs 16–19): gave logit std ≈ 5, E[CE] ≈ 21.5 nats, producing step-0 training losses of 17–23 nats. Changed after run 19.
 
 ---
 
@@ -248,9 +258,9 @@ The gap between observed step-0 loss and the entropy ceiling closes within the f
 
 | Buffer | Default | Effect |
 |--------|---------|--------|
-| `PC_WEIGHT` | 0.1 | Scales total `aux_loss` contribution to the gradient |
+| `PC_WEIGHT` | 0.02 | Scales total `aux_loss` contribution to the gradient |
 | `pc_focal_gamma` | 1.0 | Exponent for output-difficulty weighting of `pc_loss` (0 = uniform) |
-| `kl_weight` | 0.01 | Scales the KL divergence loss from stochastic layers; linearly ramped from 0 over first 200 steps |
+| `kl_weight` | 0.01 | Scales the KL divergence loss from stochastic layers; linearly ramped from 0 over first 25 steps |
 | `pc_scale` | √512 ≈ 22.6 | Fixed denominator making prediction errors dimensionless (Bogacz 2017) |
 
 ---
@@ -261,10 +271,11 @@ These are read once at launch and affect training setup or behavior without chan
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `PC_WEIGHT` | `0.1` | Weight applied to `aux_loss` in the training loop |
+| `PC_WEIGHT` | `0.02` | Weight applied to `aux_loss` in the training loop |
 | `PC_FOCAL_GAMMA` | `1.0` | Output-difficulty focal exponent (0 = uniform) |
-| `KL_WEIGHT` | `0.01` | Final KL weight after warmup |
+| `KL_WEIGHT` | `0.01` | Final KL weight after warmup (25-step ramp) |
 | `PC_HEAD_DIM` | `max(64, DEPTH*ASPECT_RATIO//8)` | Bottleneck dimension for PC prediction heads |
+| `LOG_MIN_WINDOW` | `0` | Minimum attention window for LOG pattern (0 = auto: `seq_len // n_layer`); set e.g. `64` to override |
 | `PC_DIAG_INTERVAL` | `50` | Steps between PC diagnostic prints (0 = off) |
 | `RESUME_CHECKPOINT` | `""` | Path to a `checkpoint.pt` to resume from; restores model weights, optimizer state, `step`, and `total_training_time` |
 | `VAL_INTERVAL` | `0` | Steps between mid-training `evaluate_bpb` calls (0 = disabled) |
