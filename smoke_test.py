@@ -444,7 +444,7 @@ def test_forward_numerics():
     with torch.no_grad():
         model.resid_lambdas.fill_(-1e6)
     with AUTOCAST:
-        loss2, aux2 = model(x, y)
+        loss2, aux2, _ = model(x, y)
     assert not loss2.isnan().any(), \
         "loss is NaN with extreme negative resid_lambdas (softplus fix broken?)"
     assert not loss2.isinf().any(), \
@@ -460,7 +460,7 @@ def test_forward_numerics():
     # Run a second clean forward to confirm the einsums complete without error
     model.zero_grad()
     with AUTOCAST:
-        loss3, aux3 = model(x, y)
+        loss3, aux3, _ = model(x, y)
         (loss3 + 0.1 * aux3).backward()
     assert_finite(loss3, "loss3 (pc_head_dim einsum check)")
 
