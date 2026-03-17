@@ -351,9 +351,10 @@ class GPT(nn.Module):
     def init_weights(self):
         # Embedding and unembedding
         # lm_head.weight is tied to wte.weight in __main__ — init wte only.
-        # Target logit std ≈ 5 at init (< softcap=15): wte_std = 5 / sqrt(n_embd).
-        # std=1.0 produced logit_std ≈ sqrt(n_embd) ≈ 22.6, saturating the softcap.
-        wte_std = 5.0 / (self.config.n_embd ** 0.5)
+        # Target logit std ≈ 1.75 at init → E[CE] ≈ ln(vocab) + σ²/2 ≈ 9.01 + 1.5 ≈ 10.5 nats.
+        # wte_std = σ_target / sqrt(n_embd): 1.75 / sqrt(512) ≈ 0.077.
+        # (Previous 5.0/sqrt gave logit_std≈5, E[CE]≈21.5 nats — run 19 starting loss.)
+        wte_std = 1.75 / (self.config.n_embd ** 0.5)
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=wte_std)
         for head in self.aux_lm_heads:
             torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
@@ -534,12 +535,18 @@ class GPT(nn.Module):
         gate_biases = self.pc_gate_b.tolist()                            # learned gate threshold
         attn_temps  = [(block.attn.attn_temp.square() + 0.01).item()
                        for block in self.transformer.h]                  # effective attn temperature
+        # Sigma bias: exp(log_sigma_proj.bias) gives baseline sigma when weight contribution
+        # is small.  Stays near exp(-3)≈0.05 if StochasticLayer is collapsed (deterministic).
+        sigma_bias_exp = [sl.log_sigma_proj.bias.exp().mean().item()
+                          for sl in self.stochastic_layers
+                          if isinstance(sl, StochasticLayer)]
         return {
-            "pc_weights":  pc_weights,
-            "resid":       resid,
-            "gate_biases": gate_biases,
-            "attn_temps":  attn_temps,
-            "n_layer":     n,
+            "pc_weights":     pc_weights,
+            "resid":          resid,
+            "gate_biases":    gate_biases,
+            "attn_temps":     attn_temps,
+            "sigma_bias_exp": sigma_bias_exp,
+            "n_layer":        n,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
@@ -851,10 +858,11 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Predictive coding — readable from env so orchestrator can sweep without recompile
-PC_WEIGHT       = float(os.environ.get("PC_WEIGHT",       "0.1"))
-PC_FOCAL_GAMMA  = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
-KL_WEIGHT       = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
-PC_DIAG_INTERVAL = int(os.environ.get("PC_DIAG_INTERVAL", "50"))   # steps between PC diagnostic lines (0 = off)
+PC_WEIGHT        = float(os.environ.get("PC_WEIGHT",        "0.1"))
+PC_WEIGHT_WARMUP = int(os.environ.get("PC_WEIGHT_WARMUP",  "50"))   # steps to ramp PC_WEIGHT from 0→full (0 = off)
+PC_FOCAL_GAMMA   = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
+KL_WEIGHT        = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
+PC_DIAG_INTERVAL = int(os.environ.get("PC_DIAG_INTERVAL",  "50"))   # steps between PC diagnostic lines (0 = off)
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -1018,6 +1026,14 @@ if __name__ == "__main__":
     def get_kl_weight(step):
         return KL_WEIGHT * min(step / KL_WARMUP_STEPS, 1.0)
 
+    def get_pc_weight(step):
+        """Linear warmup of PC_WEIGHT from 0 → PC_WEIGHT over PC_WEIGHT_WARMUP steps.
+        Lets the backbone stabilize before the PC signal is introduced.
+        PC_WEIGHT_WARMUP=0 disables warmup (full weight from step 0)."""
+        if PC_WEIGHT_WARMUP <= 0:
+            return PC_WEIGHT
+        return PC_WEIGHT * min(step / PC_WEIGHT_WARMUP, 1.0)
+
     # ---------------------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------------------
@@ -1036,7 +1052,7 @@ if __name__ == "__main__":
             with autocast_ctx:
                 main_loss, aux_loss = model(x, y)
                 # aux_loss already contains pc_loss + kl_weight*kl_loss (folded in forward)
-                loss = main_loss + PC_WEIGHT * aux_loss
+                loss = main_loss + get_pc_weight(step) * aux_loss
             train_loss_accum += main_loss.detach()
             train_pc_loss_accum += aux_loss.detach()
             loss = loss / grad_accum_steps
@@ -1102,11 +1118,13 @@ if __name__ == "__main__":
                 parts = [f"{v:.2f}" for v in vals[:-1]]
                 parts.append("  -- " if last_marker else f"{vals[-1]:.2f}")
                 return "[" + "  ".join(parts) + "]"
+            sigma_str = "  ".join(f"{v:.3f}" for v in d['sigma_bias_exp'])
             print(f"\n  pc_diag step {step + 1:05d}"
                   f"\n    pc_weights : {_fmt(d['pc_weights'])}"
                   f"\n    gate_biases: {_fmt(d['gate_biases'])}"
                   f"\n    resid_λ    : {_fmt(d['resid'], last_marker=False)}"
-                  f"\n    attn_temps : {_fmt(d['attn_temps'], last_marker=False)}",
+                  f"\n    attn_temps : {_fmt(d['attn_temps'], last_marker=False)}"
+                  f"\n    sigma_bias : [{sigma_str}]  (exp of log_sigma bias; ~0.05=collapsed, ~1.0=active)",
                   flush=True)
 
         if VAL_INTERVAL > 0 and step > 0 and step % VAL_INTERVAL == 0:
