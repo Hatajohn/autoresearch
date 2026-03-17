@@ -293,12 +293,11 @@ class GPT(nn.Module):
             nn.Linear(config.n_embd, config.vocab_size, bias=False)
             for _ in AUX_HORIZONS
         ])
-        # After weight tying, lm_head.weight inherits wte std=1.0, which produces
-        # logit std ≈ sqrt(n_embd) ≈ 22.6 and saturates the ±15 softcap at init.
-        # lm_head_log_scale (log-space for guaranteed positivity) starts at log(0.001)
-        # so effective logit std ≈ 0.001 * sqrt(n_embd) ≈ 0.023 — near-uniform logits,
-        # initial loss ≈ log(vocab_size).  The scale learns to grow during training.
-        self.lm_head_log_scale = nn.Parameter(torch.tensor(math.log(0.001)))
+        # Learnable output scale for lm_head (log-space, always-positive via .exp()).
+        # Initialised to 0.0 (scale=1) — neutral at init; wte_std controls the logit
+        # magnitude directly.  Provides a per-run adaptable gain on the unembedding
+        # without requiring a separate weight matrix.
+        self.lm_head_log_scale = nn.Parameter(torch.zeros(()))
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         # Value embeddings — _NoVE sentinel at non-VE layers returns None, preserving the
         # existing `if ve is not None` guard in CausalSelfAttention without any dict lookup.
@@ -350,8 +349,11 @@ class GPT(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         # Embedding and unembedding
-        # lm_head.weight is tied to wte.weight in __main__ — init wte only
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        # lm_head.weight is tied to wte.weight in __main__ — init wte only.
+        # Target logit std ≈ 5 at init (< softcap=15): wte_std = 5 / sqrt(n_embd).
+        # std=1.0 produced logit_std ≈ sqrt(n_embd) ≈ 22.6, saturating the softcap.
+        wte_std = 5.0 / (self.config.n_embd ** 0.5)
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=wte_std)
         for head in self.aux_lm_heads:
             torch.nn.init.normal_(head.weight, mean=0.0, std=0.001)
         # Transformer blocks — single pass covers attention, MLP, PC heads, and gates
@@ -406,7 +408,7 @@ class GPT(nn.Module):
         self.pc_focal_gamma.fill_(PC_FOCAL_GAMMA)
         self.kl_weight.fill_(KL_WEIGHT)
         self.pc_scale.fill_(float(self.config.n_embd) ** 0.5)
-        self.lm_head_log_scale.fill_(math.log(0.001))
+        self.lm_head_log_scale.fill_(0.0)  # neutral (scale=1); wte_std drives the logit magnitude
         for sl in self.stochastic_layers:
             if isinstance(sl, StochasticLayer):
                 sl.noise_scale.fill_(1.0)   # start in training mode (1.0 = add noise)
@@ -556,7 +558,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # pc head params in AdamW: kept out of Muon to avoid polluting backbone gradient groups
-            dict(kind='adamw', params=pc_head_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            # pc heads at 0.1× matrix_lr: cold auxiliary heads diverge at full backbone LR
+            dict(kind='adamw', params=pc_head_params, lr=matrix_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # summarizer matrices use AdamW (small, non-square conv/proj weights)
             dict(kind='adamw', params=summarizer_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             # stochastic layer matrices at a fraction of matrix_lr: Adam sign-normalises
