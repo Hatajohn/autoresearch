@@ -65,6 +65,7 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     ve_gate_channels: int = 0   # 0 = auto: max(32, n_embd // 16)
     pc_head_dim: int = 64       # bottleneck dim for PC prediction heads
+    log_min_window: int = 0     # 0 = auto (seq // n_layer, tile-rounded); >0 overrides for LOG pattern
 
 
 def norm(x):
@@ -453,13 +454,21 @@ class GPT(nn.Module):
             # Trade-off: richer timescale hierarchy at the cost of a longer cold-cache
             # compile (paid once; subsequent runs use the kernel cache).
             tile = 128
-            min_w = max(64, long_window // n)
-            min_w = ((min_w + tile - 1) // tile) * tile  # round up to nearest tile
+            if config.log_min_window > 0:
+                # Explicit override: use exactly the requested value.
+                # tile_eff is clamped to min_w so the snap-to-tile inside the loop
+                # cannot round 64 up to 128.
+                min_w = config.log_min_window
+                tile_eff = min(tile, min_w)
+            else:
+                min_w = max(64, long_window // n)
+                min_w = ((min_w + tile - 1) // tile) * tile  # round up to nearest tile
+                tile_eff = tile
             window_sizes = []
             for i in range(n - 1):
-                t = i / (n - 1)                          # 0.0 → (n-2)/(n-1)
-                w = min_w * (long_window / min_w) ** t   # geometric interpolation
-                w = max(tile, round(w / tile) * tile)    # snap to tile boundary
+                t = i / (n - 1)                                    # 0.0 → (n-2)/(n-1)
+                w = min_w * (long_window / min_w) ** t             # geometric interpolation
+                w = max(tile_eff, round(w / tile_eff) * tile_eff)  # snap to tile boundary
                 window_sizes.append((w, 0))
             window_sizes.append((long_window, 0))        # last layer always full context
             return window_sizes
@@ -847,6 +856,7 @@ PC_DIAG_INTERVAL = int(os.environ.get("PC_DIAG_INTERVAL", "50"))   # steps betwe
 DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 32   # per-device batch size (RTX 4080 16GB; H100 default was 128)
 PC_HEAD_DIM = int(os.environ.get("PC_HEAD_DIM", str(max(64, DEPTH * ASPECT_RATIO // 8))))
+LOG_MIN_WINDOW = int(os.environ.get("LOG_MIN_WINDOW", "0"))  # 0 = auto; set e.g. 64 to override
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -896,6 +906,7 @@ if __name__ == "__main__":
             n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
             window_pattern=WINDOW_PATTERN,
             pc_head_dim=PC_HEAD_DIM,
+            log_min_window=LOG_MIN_WINDOW,
         )
 
     config = build_model_config(DEPTH)
