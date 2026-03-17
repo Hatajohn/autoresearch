@@ -458,7 +458,11 @@ class GPT(nn.Module):
                 # Explicit override: use exactly the requested value.
                 # tile_eff is clamped to min_w so the snap-to-tile inside the loop
                 # cannot round 64 up to 128.
-                min_w = config.log_min_window
+                v = config.log_min_window
+                assert v >= 16 and (v & (v - 1)) == 0, (
+                    f"log_min_window must be a power of 2 and >= 16, got {v}"
+                )
+                min_w = v
                 tile_eff = min(tile, min_w)
             else:
                 min_w = max(64, long_window // n)
