@@ -370,8 +370,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Stacked PC head weights — vectorised init outside block loop
-        torch.nn.init.uniform_(self.pc_fc_w, -s, s)
-        torch.nn.init.zeros_(self.pc_proj_w)      # zero-init → identity residual at step 0
+        torch.nn.init.zeros_(self.pc_fc_w)         # zero-init matches pc_proj_w=0; residual pred grows smoothly
+        torch.nn.init.zeros_(self.pc_proj_w)      # zero-init → pred = h_stack (identity residual) at step 0
         torch.nn.init.zeros_(self.pc_gate_w)
         self.pc_gate_b.fill_(1.0)                 # sigmoid(1) ≈ 0.73; most tokens active at init
         # Per-layer scalars
@@ -388,6 +388,8 @@ class GPT(nn.Module):
                 torch.nn.init.eye_(sl.mu_proj.weight)
                 torch.nn.init.zeros_(sl.log_sigma_proj.weight)
                 torch.nn.init.constant_(sl.log_sigma_proj.bias, -3.0)
+            else:
+                sl._zero.zero_()  # meta-device to_empty() does not guarantee zero init
         # TemporalSummarizer: zero-init proj so residual starts as identity
         for summ in self.summarizers:
             if isinstance(summ, TemporalSummarizer):
@@ -617,23 +619,26 @@ class GPT(nn.Module):
         # learns to focus or suppress.  Gradient flows back through the weighted-MSE
         # loss (stable softplus layer weights), not through an explicit residual
         # correction (which would require a second forward pass).
-        # Normalise the final layer once; reuse as broadcast target (detached)
-        # and as the lm_head input (with gradient).
+        # Normalise all layer outputs; reuse final_normed as the lm_head input (with gradient).
+        # Per-layer PC targets: layer i predicts layer i+1 (hierarchical, not a single broadcast).
+        # Each target is detached so the upper layer sets the context without receiving gradient
+        # through this path — only the predictor (lower layer) is trained by the error.
         final_normed = norm(layer_outs[-1])
-        broadcast = final_normed.detach()
         L = self.config.n_layer - 1
-        h_stack = torch.stack([norm(layer_outs[i]) for i in range(L)])   # (L, B, T, C)
+        normed_outs = [norm(layer_outs[i]) for i in range(self.config.n_layer)]
+        h_stack      = torch.stack(normed_outs[:L])                                             # (L, B, T, C) — predictors
+        targets_stack = torch.stack([normed_outs[i + 1].detach() for i in range(L)])            # (L, B, T, C) — per-layer targets
 
         # Residual pred_head: pred = h + proj(tanh(fc(h)))
         fc_out  = torch.einsum('lbtc,ldc->lbtd', h_stack, self.pc_fc_w[:L])              # (L, B, T, pc_head_dim)
         pred    = h_stack + torch.einsum('lbtd,ldc->lbtc', torch.tanh(fc_out), self.pc_proj_w[:L])  # (L, B, T, C)
 
-        raw_error = (broadcast.unsqueeze(0) - pred) / self.pc_scale                      # (L, B, T, C)
+        raw_error = (targets_stack - pred) / self.pc_scale                                # (L, B, T, C)
         pc_w      = F.softplus(self.pc_log_lambdas[:L]).view(L, 1, 1)                    # (L, 1, 1)
         token_pc  = pc_w * raw_error.pow(2).mean(dim=-1)                                 # (L, B, T)
 
         # Gate: per-layer linear → sigmoid.  pc_gate_w is (n_layer, C), pc_gate_b is (n_layer,)
-        gate_logit = torch.einsum('lbtc,lc->lbt', h_stack, self.pc_gate_w[:L])           # (L, B, T)
+        gate_logit = torch.einsum('lbtc,lc->lbt', h_stack.detach(), self.pc_gate_w[:L])   # (L, B, T); detach prevents backbone from nulling the gate
         gate       = torch.sigmoid(gate_logit + self.pc_gate_b[:L].view(L, 1, 1))        # (L, B, T)
 
         pc_loss_map = (gate * token_pc).sum(dim=0)                                        # (B, T)
