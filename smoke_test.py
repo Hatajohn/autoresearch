@@ -149,7 +149,7 @@ def test_eager_training_scale():
     y = torch.randint(0, config.vocab_size, (1, 256), device=DEVICE)
 
     with AUTOCAST:
-        main_loss, aux_loss = model(x, y)
+        main_loss, aux_loss, layer_means = model(x, y)
         (main_loss + 0.1 * aux_loss).backward()
 
     assert_finite(main_loss, "main_loss")
@@ -157,6 +157,9 @@ def test_eager_training_scale():
     assert math.isfinite(main_loss.item()), f"main_loss not finite: {main_loss.item()}"
     assert aux_loss.shape == (), f"aux_loss should be scalar, got shape {aux_loss.shape}"
     assert aux_loss.item() >= 0, f"aux_loss should be non-negative (pc_loss≥0), got {aux_loss.item()}"
+    assert layer_means.shape == (config.n_layer - 1, config.n_embd), \
+        f"layer_means shape {layer_means.shape} != ({config.n_layer - 1}, {config.n_embd})"
+    assert layer_means.dtype == torch.float32, f"layer_means dtype {layer_means.dtype} should be float32"
 
     print(f"{PASS}  loss={main_loss.item():.4f}  aux={aux_loss.item():.4f}  pc_scale={pc_scale:.2f}")
 
@@ -192,7 +195,7 @@ def test_compiled_small_scale():
     y = torch.randint(0, config.vocab_size, (2, 64), device=DEVICE)
 
     with AUTOCAST:
-        main_loss, aux_loss = model(x, y)
+        main_loss, aux_loss, layer_means = model(x, y)
         (main_loss + 0.1 * aux_loss).backward()
 
     assert_finite(main_loss, "main_loss (compiled)")
@@ -200,6 +203,7 @@ def test_compiled_small_scale():
     assert math.isfinite(main_loss.item()), f"compiled main_loss not finite: {main_loss.item()}"
     assert aux_loss.shape == (), f"compiled aux_loss should be scalar, got shape {aux_loss.shape}"
     assert aux_loss.item() >= 0, f"compiled aux_loss should be non-negative, got {aux_loss.item()}"
+    assert layer_means.dtype == torch.float32, f"compiled layer_means dtype {layer_means.dtype} should be float32"
 
     print(f"{PASS}  loss={main_loss.item():.4f}  aux={aux_loss.item():.4f}")
 
@@ -324,6 +328,50 @@ def test_model_invariants():
         f"EMBEDDING_LR expected 0.1, got {_train_module.EMBEDDING_LR}"
     )
 
+    # ── lm_head_log_scale: new scalar parameter ──────────────────────────────
+    assert hasattr(model, 'lm_head_log_scale'), \
+        "GPT is missing lm_head_log_scale parameter"
+    assert model.lm_head_log_scale.shape == (), \
+        f"lm_head_log_scale should be scalar, got {model.lm_head_log_scale.shape}"
+    assert abs(model.lm_head_log_scale.item()) < 1e-6, \
+        f"lm_head_log_scale should init to 0.0 (scale=1), got {model.lm_head_log_scale.item()}"
+    assert abs(model.lm_head_log_scale.exp().item() - 1.0) < 1e-5, \
+        "exp(lm_head_log_scale) should be 1.0 at init (neutral)"
+    # Must appear in optimizer param groups
+    lls_id = id(model.lm_head_log_scale)
+    assert lls_id in all_opt_param_ids, \
+        "lm_head_log_scale not found in any optimizer param group"
+
+    # ── get_pc_diagnostics() includes sigma_bias_exp ─────────────────────────
+    diag = model.get_pc_diagnostics()
+    assert "sigma_bias_exp" in diag, \
+        "get_pc_diagnostics() missing 'sigma_bias_exp' key"
+    n_stoch = sum(1 for sl in model.stochastic_layers if isinstance(sl, StochasticLayer))
+    assert len(diag["sigma_bias_exp"]) == n_stoch, (
+        f"sigma_bias_exp has {len(diag['sigma_bias_exp'])} entries, "
+        f"expected {n_stoch} (one per StochasticLayer)"
+    )
+    # log_sigma_proj.bias is initialised to -3.0, so exp(-3) ≈ 0.050
+    expected_sigma_exp = math.exp(-3.0)
+    for i, v in enumerate(diag["sigma_bias_exp"]):
+        assert abs(v - expected_sigma_exp) / expected_sigma_exp < 0.05, (
+            f"sigma_bias_exp[{i}]={v:.4f}, expected ≈{expected_sigma_exp:.4f} "
+            f"(exp(-3)=0.050 at init)"
+        )
+
+    # ── num_scaling_params() deduplicates lm_head after weight tying ─────────
+    counts = model.num_scaling_params()
+    assert counts['lm_head_tied'] is True, \
+        f"num_scaling_params lm_head_tied expected True, got {counts['lm_head_tied']}"
+    assert counts['lm_head'] == 0, \
+        f"num_scaling_params lm_head expected 0 (tied), got {counts['lm_head']}"
+    # scalars now includes lm_head_log_scale (1 element) + resid_lambdas + pc_log_lambdas
+    expected_scalars = config.n_layer * 2 + 1   # resid + pc_log + lm_head_log_scale
+    assert counts['scalars'] == expected_scalars, (
+        f"num_scaling_params scalars expected {expected_scalars} "
+        f"(n_layer×2 + 1 for lm_head_log_scale), got {counts['scalars']}"
+    )
+
     print(f"{PASS}")
 
 
@@ -360,7 +408,7 @@ def test_forward_numerics():
     assert hooks, "No StochasticLayer found in model — cannot test KL dtype"
 
     with AUTOCAST:
-        main_loss, aux_loss = model(x, y)
+        main_loss, aux_loss, layer_means = model(x, y)
         (main_loss + 0.1 * aux_loss).backward()
 
     for h in hooks:
@@ -374,6 +422,22 @@ def test_forward_numerics():
 
     assert_finite(main_loss, "main_loss (forward_numerics)")
     assert_finite(aux_loss,  "aux_loss  (forward_numerics)")
+
+    # ── wte_std init: target logit_std ≈ 1.75 so E[CE] ≈ 10.5 nats at step 0 ─
+    # wte_std = 1.75/sqrt(n_embd); verify the embedding weight std matches.
+    expected_wte_std = 1.75 / (config.n_embd ** 0.5)
+    actual_wte_std = model.transformer.wte.weight.float().std().item()
+    assert abs(actual_wte_std - expected_wte_std) / expected_wte_std < 0.15, (
+        f"wte weight std={actual_wte_std:.4f}, expected ≈{expected_wte_std:.4f} "
+        f"(1.75/sqrt(n_embd)); initial CE will be far from target ~10.5 nats"
+    )
+
+    # ── lm_head_log_scale: forward multiplies logits by exp(scale), which is 1.0
+    # at init — verify the parameter value and that loss is finite (already above).
+    assert abs(model.lm_head_log_scale.item()) < 1e-6, \
+        f"lm_head_log_scale not 0.0 at init: {model.lm_head_log_scale.item()}"
+    assert abs(model.lm_head_log_scale.exp().item() - 1.0) < 1e-5, \
+        "exp(lm_head_log_scale) ≠ 1.0 at init — logit scale is unexpectedly non-neutral"
 
     # ── Step 3 stress: extreme negative resid_lambdas must not cause NaN ─────
     model.zero_grad()
@@ -445,7 +509,7 @@ def test_grad_norm_and_checkpoint():
 
     # ── Step 5: grad_norm is finite and positive ─────────────────────────────
     with autocast_ctx:
-        main_loss, aux_loss = model(x, y)
+        main_loss, aux_loss, _layer_means = model(x, y)
         (main_loss + 0.1 * aux_loss).backward()
 
     all_params = [p for g in optimizer.param_groups for p in g['params']]
@@ -509,6 +573,53 @@ def test_grad_norm_and_checkpoint():
 
 
 # ---------------------------------------------------------------------------
+# Test 6b — LOG_MIN_WINDOW validation
+# ---------------------------------------------------------------------------
+def test_new_features():
+    """
+    LOG_MIN_WINDOW — power-of-2 / >=16 validation; sets first-layer window.
+    """
+    print("Test 6b [LOG_MIN_WINDOW]  ...", end="  ", flush=True)
+
+    # ── LOG_MIN_WINDOW validation ────────────────────────────────────────────
+    # Valid power-of-2 values >= 16 must not raise.
+    for valid_v in (16, 32, 64, 128):
+        cfg = GPTConfig(
+            sequence_len=512, vocab_size=256, n_layer=4, n_head=2,
+            n_kv_head=2, n_embd=128, window_pattern="LOG",
+            log_min_window=valid_v,
+        )
+        try:
+            GPT(cfg)   # triggers _compute_window_sizes
+        except AssertionError as e:
+            raise AssertionError(f"log_min_window={valid_v} should be valid but raised: {e}")
+
+    # Non-power-of-2 must raise.
+    for bad_v in (63, 100, 15):
+        cfg = GPTConfig(
+            sequence_len=512, vocab_size=256, n_layer=4, n_head=2,
+            n_kv_head=2, n_embd=128, window_pattern="LOG",
+            log_min_window=bad_v,
+        )
+        raised = False
+        try:
+            GPT(cfg)
+        except AssertionError:
+            raised = True
+        assert raised, f"log_min_window={bad_v} should have raised AssertionError"
+
+    # log_min_window=0 (auto) must not raise for any pattern.
+    for pat in ("LOG", "PROGRESSIVE", "SSSL"):
+        cfg = GPTConfig(
+            sequence_len=512, vocab_size=256, n_layer=4, n_head=2,
+            n_kv_head=2, n_embd=128, window_pattern=pat,
+        )
+        GPT(cfg)
+
+    print(f"{PASS}")
+
+
+# ---------------------------------------------------------------------------
 # Test 6 — VAL_INTERVAL control-flow
 # ---------------------------------------------------------------------------
 def test_val_interval_fires():
@@ -550,11 +661,12 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
 
     tests = [
-        ("Test 1", test_eager_training_scale),
-        ("Test 3", test_model_invariants),
-        ("Test 4", test_forward_numerics),
-        ("Test 5", test_grad_norm_and_checkpoint),
-        ("Test 6", test_val_interval_fires),
+        ("Test 1",  test_eager_training_scale),
+        ("Test 3",  test_model_invariants),
+        ("Test 4",  test_forward_numerics),
+        ("Test 5",  test_grad_norm_and_checkpoint),
+        ("Test 6",  test_val_interval_fires),
+        ("Test 6b", test_new_features),
     ]
 
     for name, fn in tests:

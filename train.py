@@ -346,6 +346,11 @@ class GPT(nn.Module):
         self.pc_proj_w = nn.Parameter(torch.zeros(config.n_layer, config.pc_head_dim, config.n_embd))
         self.pc_gate_w = nn.Parameter(torch.zeros(config.n_layer, config.n_embd))  # (n_layer, C)
         self.pc_gate_b = nn.Parameter(torch.ones(config.n_layer))                  # (n_layer,) scalar bias per layer
+        # EMA of each layer's mean representation — stationary targets for PC heads.
+        # Updated OUTSIDE the compiled graph (after each optimizer step) so forward is
+        # read-only with respect to this buffer, which is required for fullgraph=True.
+        # Shape: (n_layer-1, n_embd) — one target per predictor layer.
+        self.register_buffer('pc_ema', torch.zeros(config.n_layer - 1, config.n_embd))  # float32, persistent
 
     @torch.no_grad()
     def init_weights(self):
@@ -413,6 +418,7 @@ class GPT(nn.Module):
         self.kl_weight.fill_(KL_WEIGHT)
         self.pc_scale.fill_(float(self.config.n_embd) ** 0.5)
         self.lm_head_log_scale.fill_(0.0)  # neutral (scale=1); wte_std drives the logit magnitude
+        self.pc_ema.zero_()  # meta-device safe; first optimizer step will update from real activations
         for sl in self.stochastic_layers:
             if isinstance(sl, StochasticLayer):
                 sl.noise_scale.fill_(1.0)   # start in training mode (1.0 = add noise)
@@ -629,10 +635,11 @@ class GPT(nn.Module):
             layer_outs.append(x)
 
         # ── Phase 2: hierarchical predictive coding ─────────────────────────
-        # Layer i predicts norm(layer_outs[i+1]) — its immediate neighbour,
-        # not a single global broadcast.  Each target is detached so the upper
-        # layer cannot receive gradient through this path; only the predictor
-        # (lower layer) trains on the error.
+        # Layer i predicts an EMA of norm(layer_outs[i+1]) across recent batches.
+        # Using a stationary EMA target instead of the instantaneous layer output
+        # removes the step-to-step oscillation that prevented PC head convergence
+        # (run 19/20 post-mortems).  The EMA buffer is updated in the training loop
+        # OUTSIDE the compiled graph; here it is read-only.
         #
         # The routing gate weights which tokens receive a strong PC signal.
         # At sigmoid(bias=1)≈0.73 initialisation most tokens contribute; the gate
@@ -641,15 +648,16 @@ class GPT(nn.Module):
         # correction (which would require a second forward pass).
         L = self.config.n_layer - 1
         normed_outs   = [norm(layer_outs[i]) for i in range(self.config.n_layer)]
-        final_normed  = normed_outs[-1]                                                          # reuse; avoids a redundant norm() call
-        h_stack       = torch.stack(normed_outs[:L])                                             # (L, B, T, C) — predictors
-        targets_stack = torch.stack([normed_outs[i + 1].detach() for i in range(L)])            # (L, B, T, C) — per-layer targets
+        final_normed  = normed_outs[-1]                                                                          # reuse; avoids a redundant norm() call
+        h_stack       = torch.stack(normed_outs[:L])                                                             # (L, B, T, C) — predictors
+        # EMA target: broadcast (L, C) → (L, B, T, C).  Cast to match h_stack dtype (bfloat16 under autocast).
+        ema_target    = self.pc_ema.to(dtype=h_stack.dtype).unsqueeze(1).unsqueeze(1).expand(L, B, T, C)        # (L, B, T, C) — stationary targets
 
         # Residual pred_head: pred = h + proj(tanh(fc(h)))
         fc_out  = torch.einsum('lbtc,ldc->lbtd', h_stack, self.pc_fc_w[:L])              # (L, B, T, pc_head_dim)
         pred    = h_stack + torch.einsum('lbtd,ldc->lbtc', torch.tanh(fc_out), self.pc_proj_w[:L])  # (L, B, T, C)
 
-        raw_error = (targets_stack - pred) / self.pc_scale                                # (L, B, T, C)
+        raw_error = (ema_target - pred) / self.pc_scale                                    # (L, B, T, C)
         pc_w      = F.softplus(self.pc_log_lambdas[:L]).view(L, 1, 1)                    # (L, 1, 1)
         token_pc  = pc_w * raw_error.pow(2).mean(dim=-1)                                 # (L, B, T)
 
@@ -695,9 +703,15 @@ class GPT(nn.Module):
             tc_det = token_ce.detach()
             difficulty = (tc_det / (tc_det.mean() + 1e-6)).pow(self.pc_focal_gamma)
             pc_loss = (pc_loss_map * difficulty).mean() / max(1, len(self.transformer.h) - 1)
-            # Fold kl_loss into pc_loss before returning so callers (including
-            # evaluate_bpb in prepare.py) always receive a 2-tuple (loss, aux_loss).
+            # Fold kl_loss into pc_loss before returning.
             aux_loss = pc_loss + self.kl_weight * kl_loss
+            if reduction == 'mean':
+                # Return per-layer mean representations for EMA update in the training loop.
+                # detach() + float() keeps float32 precision outside the autocast context.
+                layer_means = torch.stack(
+                    [normed_outs[i + 1].detach().float().mean(dim=(0, 1)) for i in range(L)]
+                )  # (L, C) float32
+                return loss, aux_loss, layer_means
             return loss, aux_loss
         return logits
 
@@ -858,8 +872,7 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Predictive coding — readable from env so orchestrator can sweep without recompile
-PC_WEIGHT        = float(os.environ.get("PC_WEIGHT",        "0.1"))
-PC_WEIGHT_WARMUP = int(os.environ.get("PC_WEIGHT_WARMUP",  "50"))   # steps to ramp PC_WEIGHT from 0→full (0 = off)
+PC_WEIGHT        = float(os.environ.get("PC_WEIGHT",        "0.02"))
 PC_FOCAL_GAMMA   = float(os.environ.get("PC_FOCAL_GAMMA",  "1.0"))  # 0.0 = uniform (no focal)
 KL_WEIGHT        = float(os.environ.get("KL_WEIGHT",       "0.01")) # KL div from stochastic layers
 PC_DIAG_INTERVAL = int(os.environ.get("PC_DIAG_INTERVAL",  "50"))   # steps between PC diagnostic lines (0 = off)
@@ -983,10 +996,29 @@ if __name__ == "__main__":
     _dummy_x = torch.zeros(DEVICE_BATCH_SIZE, MAX_SEQ_LEN, dtype=torch.long, device=device)
     _dummy_y = torch.zeros(DEVICE_BATCH_SIZE, MAX_SEQ_LEN, dtype=torch.long, device=device)
     with autocast_ctx:
-        _d_loss, _d_aux = model(_dummy_x, _dummy_y)
+        _d_loss, _d_aux, _d_means = model(_dummy_x, _dummy_y)
         (_d_loss + PC_WEIGHT * _d_aux).backward()
     model.zero_grad(set_to_none=True)
-    del _dummy_x, _dummy_y, _d_loss, _d_aux
+    del _d_loss, _d_aux, _d_means
+    # Pre-warm the eval kernel (reduction='none' is a distinct compiled graph variant).
+    # Without this, evaluate_bpb triggers a fresh Triton compile at the END of the run,
+    # wasting ~8 minutes of wall-clock time after the training loop completes.
+    with torch.no_grad():
+        with autocast_ctx:
+            _d_eval_loss, _d_eval_aux = model(_dummy_x, _dummy_y, reduction='none')
+    del _d_eval_loss, _d_eval_aux
+    # Step-0 diagnostic: log logit std and raw CE before any weight update.
+    # Compares against the smoke-test value (≈10.80) to confirm prod matches expectations.
+    with torch.no_grad():
+        with autocast_ctx:
+            _step0_logits = model(_dummy_x)  # (B, T, vocab_size) — no targets → returns logits
+        _step0_logit_std = _step0_logits.float().std().item()
+        _step0_raw_ce = F.cross_entropy(
+            _step0_logits.float().view(-1, _step0_logits.size(-1)), _dummy_y.view(-1)
+        ).item()
+        print(f"  step-0 diagnostic: logit_std={_step0_logit_std:.4f}, raw_CE={_step0_raw_ce:.4f} nats "
+              f"(expected ≈10.5; smoke test ≈10.80)", flush=True)
+    del _dummy_x, _dummy_y, _step0_logits
     torch.cuda.synchronize()
     t_prewarm = time.time() - _t_prewarm
     print(f"  kernel pre-warm done ({t_prewarm:.0f}s)", flush=True)
@@ -1022,17 +1054,9 @@ if __name__ == "__main__":
     def get_weight_decay(progress):
         return WEIGHT_DECAY * (1 - progress)
 
-    KL_WARMUP_STEPS = 200  # ramp kl_weight from 0 → KL_WEIGHT over this many steps
+    KL_WARMUP_STEPS = 25  # ramp kl_weight from 0 → KL_WEIGHT over this many steps
     def get_kl_weight(step):
         return KL_WEIGHT * min(step / KL_WARMUP_STEPS, 1.0)
-
-    def get_pc_weight(step):
-        """Linear warmup of PC_WEIGHT from 0 → PC_WEIGHT over PC_WEIGHT_WARMUP steps.
-        Lets the backbone stabilize before the PC signal is introduced.
-        PC_WEIGHT_WARMUP=0 disables warmup (full weight from step 0)."""
-        if PC_WEIGHT_WARMUP <= 0:
-            return PC_WEIGHT
-        return PC_WEIGHT * min(step / PC_WEIGHT_WARMUP, 1.0)
 
     # ---------------------------------------------------------------------------
     # Training loop
@@ -1048,13 +1072,15 @@ if __name__ == "__main__":
         model.kl_weight.fill_(get_kl_weight(step))
         train_loss_accum = torch.zeros((), device=device)
         train_pc_loss_accum = torch.zeros((), device=device)
+        _last_layer_means = None
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
-                main_loss, aux_loss = model(x, y)
+                main_loss, aux_loss, _layer_means = model(x, y)
                 # aux_loss already contains pc_loss + kl_weight*kl_loss (folded in forward)
-                loss = main_loss + get_pc_weight(step) * aux_loss
+                loss = main_loss + PC_WEIGHT * aux_loss
             train_loss_accum += main_loss.detach()
             train_pc_loss_accum += aux_loss.detach()
+            _last_layer_means = _layer_means  # keep last micro-step; used for EMA update below
             loss = loss / grad_accum_steps
             loss.backward()
             x, y, epoch = next(train_loader)
@@ -1079,6 +1105,10 @@ if __name__ == "__main__":
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
         model.zero_grad(set_to_none=True)
+        # Update PC EMA target buffer outside the compiled graph (buffer is read-only inside forward).
+        # decay=0.99 → ~100-step time constant; ensures targets drift slowly relative to PC head LR.
+        with torch.no_grad():
+            model.pc_ema.mul_(0.99).add_(_last_layer_means, alpha=0.01)
 
         train_loss_f = train_loss.item()
         train_pc_loss_f = train_pc_loss.item()
