@@ -10,7 +10,10 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 # Cache compiled Triton/CUDA kernels to a persistent directory so the cache
 # survives reboots.  /tmp (the default) is wiped on every WSL/machine restart,
 # forcing a full recompile each time.  Persistent cache cuts pre-warm from
-# ~300s (cold) to ~10s (warm) on subsequent runs.
+# ~3000s cold (Ada Lovelace) / ~300s cold (H100) to ~10s warm on any GPU.
+# Note: smoke tests compile a tiny model (n_embd=192, PROGRESSIVE window) and
+# share no compiled kernel variants with the production config — running smoke
+# tests before a training run does NOT pre-warm the production cache.
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                       os.path.expanduser("~/.cache/torchinductor"))
@@ -480,7 +483,10 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        # lm_head.weight is tied to wte.weight after weight tying — count 0 to avoid
+        # double-counting the embedding matrix in the reported total.
+        lm_head_tied = self.lm_head.weight is self.transformer.wte.weight
+        lm_head = 0 if lm_head_tied else sum(p.numel() for p in self.lm_head.parameters())
         aux_heads = sum(p.numel() for p in self.aux_lm_heads.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.pc_log_lambdas.numel()
@@ -489,7 +495,8 @@ class GPT(nn.Module):
         pc_heads = sum(p.numel() for p in [self.pc_fc_w, self.pc_proj_w, self.pc_gate_w, self.pc_gate_b])
         total = wte + value_embeds + lm_head + aux_heads + transformer_matrices + scalars + summarizers + stochastic + pc_heads
         return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head, 'aux_heads': aux_heads,
+            'wte': wte, 'value_embeds': value_embeds,
+            'lm_head': lm_head, 'lm_head_tied': lm_head_tied, 'aux_heads': aux_heads,
             'transformer_matrices': transformer_matrices, 'scalars': scalars,
             'summarizers': summarizers, 'stochastic': stochastic, 'pc_heads': pc_heads, 'total': total,
         }
@@ -857,7 +864,10 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda")
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-    H100_BF16_PEAK_FLOPS = 989.5e12
+    # MFU is reported relative to H100 SXM5 BF16 peak (989.5 TFLOPS) as a fixed
+    # reference point so numbers are comparable across runs regardless of hardware.
+    # On Ada Lovelace (RTX 4080/4090, ~165 TFLOPS BF16) true utilisation is ~6x higher.
+    REFERENCE_BF16_PEAK_FLOPS = 989.5e12
 
     print("Loading tokenizer...", flush=True)
     _t0 = time.time()
@@ -889,6 +899,11 @@ if __name__ == "__main__":
     t_model_init = time.time() - _t0
     print(f"  model init done ({t_model_init:.1f}s)", flush=True)
 
+    # Weight tying: lm_head shares weights with the input embedding.
+    # Must happen before num_scaling_params() (to report the correct unique count)
+    # and before setup_optimizer() (so the tied tensor is not in two param groups).
+    model.lm_head.weight = model.transformer.wte.weight
+
     param_counts = model.num_scaling_params()
     print("Parameter counts:")
     for key, value in param_counts.items():
@@ -896,10 +911,6 @@ if __name__ == "__main__":
     num_params = param_counts['total']
     num_flops_per_token = model.estimate_flops()
     print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-    # Weight tying: lm_head shares weights with the input embedding.
-    # Must happen before setup_optimizer so the tied parameter is not in two groups.
-    model.lm_head.weight = model.transformer.wte.weight
 
     tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
     assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
@@ -933,7 +944,7 @@ if __name__ == "__main__":
     # Pre-warm: run one dummy forward+backward to trigger all Triton kernel compilations
     # before the training loop starts.  This makes step 0 fast and keeps the "Starting
     # training loop" message honest — all compilation noise is absorbed here.
-    print("Pre-warming kernels (dummy fwd+bwd — may take several minutes on cold cache)...", flush=True)
+    print("Pre-warming kernels (dummy fwd+bwd — ~10s warm / up to ~3000s cold on Ada Lovelace)...", flush=True)
     _t_prewarm = time.time()
     _dummy_x = torch.zeros(DEVICE_BATCH_SIZE, MAX_SEQ_LEN, dtype=torch.long, device=device)
     _dummy_y = torch.zeros(DEVICE_BATCH_SIZE, MAX_SEQ_LEN, dtype=torch.long, device=device)
@@ -1050,7 +1061,7 @@ if __name__ == "__main__":
         debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
         pct_done = 100 * progress
         tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-        mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+        mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / REFERENCE_BF16_PEAK_FLOPS
         remaining = max(0, TIME_BUDGET - total_training_time)
 
         kl_w = model.kl_weight.item()
@@ -1106,7 +1117,7 @@ if __name__ == "__main__":
     # Final summary
     t_end = time.time()
     startup_time = t_start_training - t_start
-    steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+    steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / REFERENCE_BF16_PEAK_FLOPS if total_training_time > 0 else 0
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
     ckpt_path = "checkpoint.pt"
