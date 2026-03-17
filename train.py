@@ -293,6 +293,12 @@ class GPT(nn.Module):
             nn.Linear(config.n_embd, config.vocab_size, bias=False)
             for _ in AUX_HORIZONS
         ])
+        # After weight tying, lm_head.weight inherits wte std=1.0, which produces
+        # logit std ≈ sqrt(n_embd) ≈ 22.6 and saturates the ±15 softcap at init.
+        # lm_head_log_scale (log-space for guaranteed positivity) starts at log(0.001)
+        # so effective logit std ≈ 0.001 * sqrt(n_embd) ≈ 0.023 — near-uniform logits,
+        # initial loss ≈ log(vocab_size).  The scale learns to grow during training.
+        self.lm_head_log_scale = nn.Parameter(torch.tensor(math.log(0.001)))
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         # Value embeddings — _NoVE sentinel at non-VE layers returns None, preserving the
         # existing `if ve is not None` guard in CausalSelfAttention without any dict lookup.
@@ -400,6 +406,7 @@ class GPT(nn.Module):
         self.pc_focal_gamma.fill_(PC_FOCAL_GAMMA)
         self.kl_weight.fill_(KL_WEIGHT)
         self.pc_scale.fill_(float(self.config.n_embd) ** 0.5)
+        self.lm_head_log_scale.fill_(math.log(0.001))
         for sl in self.stochastic_layers:
             if isinstance(sl, StochasticLayer):
                 sl.noise_scale.fill_(1.0)   # start in training mode (1.0 = add noise)
@@ -489,7 +496,7 @@ class GPT(nn.Module):
         lm_head = 0 if lm_head_tied else sum(p.numel() for p in self.lm_head.parameters())
         aux_heads = sum(p.numel() for p in self.aux_lm_heads.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.pc_log_lambdas.numel()
+        scalars = self.resid_lambdas.numel() + self.pc_log_lambdas.numel() + self.lm_head_log_scale.numel()
         summarizers = sum(p.numel() for p in self.summarizers.parameters())
         stochastic = sum(p.numel() for p in self.stochastic_layers.parameters())
         pc_heads = sum(p.numel() for p in [self.pc_fc_w, self.pc_proj_w, self.pc_gate_w, self.pc_gate_b])
@@ -536,7 +543,7 @@ class GPT(nn.Module):
         aux_head_params = list(self.aux_lm_heads.parameters())
         summarizer_params = list(self.summarizers.parameters())
         stochastic_params = list(self.stochastic_layers.parameters())
-        resid_params = [self.resid_lambdas, self.pc_log_lambdas] + attn_temp_params
+        resid_params = [self.resid_lambdas, self.pc_log_lambdas, self.lm_head_log_scale] + attn_temp_params
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(aux_head_params) + len(value_embeds_params) + len(resid_params) +
             len(pc_head_params) + len(summarizer_params) + len(stochastic_params))
@@ -631,7 +638,7 @@ class GPT(nn.Module):
         x = final_normed
 
         softcap = 15
-        logits = self.lm_head(x)
+        logits = self.lm_head(x) * self.lm_head_log_scale.exp()
         # Keep logits in bfloat16 — F.cross_entropy promotes internally for log-sum-exp,
         # so the explicit float32 cast only wastes ~2GB of GPU memory per forward+backward.
         logits = softcap * torch.tanh(logits / softcap)
