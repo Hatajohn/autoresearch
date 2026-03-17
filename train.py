@@ -1112,7 +1112,7 @@ if __name__ == "__main__":
         if PC_DIAG_INTERVAL > 0 and (step + 1) % PC_DIAG_INTERVAL == 0:
             d = model.get_pc_diagnostics()
             n = d["n_layer"]
-            # Phase 2 loops over layers 0..n-2; last layer is broadcast target only.
+            # Phase 2 loops over layers 0..n-2; last layer is a PC target only (not a predictor).
             # Mark it with "-" so it's visually clear it has no PC contribution.
             def _fmt(vals, last_marker=True):
                 parts = [f"{v:.2f}" for v in vals[:-1]]
