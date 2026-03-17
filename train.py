@@ -608,25 +608,21 @@ class GPT(nn.Module):
             kl_loss = kl_loss + kl_contrib
             layer_outs.append(x)
 
-        # ── Phase 2: broadcast predictive coding ────────────────────────────
-        # The final layer's normalised representation is the global top-down
-        # target broadcast to all preceding layers (Bogacz 2017, hierarchical
-        # PC).  It is detached: layer (n-1) sets the context but does not
-        # receive gradient through this path — only predictors (0..n-2) do.
+        # ── Phase 2: hierarchical predictive coding ─────────────────────────
+        # Layer i predicts norm(layer_outs[i+1]) — its immediate neighbour,
+        # not a single global broadcast.  Each target is detached so the upper
+        # layer cannot receive gradient through this path; only the predictor
+        # (lower layer) trains on the error.
         #
         # The routing gate weights which tokens receive a strong PC signal.
         # At sigmoid(bias=1)≈0.73 initialisation most tokens contribute; the gate
         # learns to focus or suppress.  Gradient flows back through the weighted-MSE
         # loss (stable softplus layer weights), not through an explicit residual
         # correction (which would require a second forward pass).
-        # Normalise all layer outputs; reuse final_normed as the lm_head input (with gradient).
-        # Per-layer PC targets: layer i predicts layer i+1 (hierarchical, not a single broadcast).
-        # Each target is detached so the upper layer sets the context without receiving gradient
-        # through this path — only the predictor (lower layer) is trained by the error.
-        final_normed = norm(layer_outs[-1])
         L = self.config.n_layer - 1
-        normed_outs = [norm(layer_outs[i]) for i in range(self.config.n_layer)]
-        h_stack      = torch.stack(normed_outs[:L])                                             # (L, B, T, C) — predictors
+        normed_outs   = [norm(layer_outs[i]) for i in range(self.config.n_layer)]
+        final_normed  = normed_outs[-1]                                                          # reuse; avoids a redundant norm() call
+        h_stack       = torch.stack(normed_outs[:L])                                             # (L, B, T, C) — predictors
         targets_stack = torch.stack([normed_outs[i + 1].detach() for i in range(L)])            # (L, B, T, C) — per-layer targets
 
         # Residual pred_head: pred = h + proj(tanh(fc(h)))
