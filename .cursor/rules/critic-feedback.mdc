@@ -1,0 +1,13 @@
+---
+description: Critic review workflow for train.py and smoke_test.py
+globs: train.py,smoke_test.py
+alwaysApply: false
+---
+
+# Critic Feedback Loop
+
+Before making any changes to `train.py` or `smoke_test.py`, read `sessions/critic_notes.md`.
+
+If that file contains unresolved items (marked `[ ]`), address them as part of your changes or explicitly explain why you are skipping one.
+
+After completing your changes, do not edit `sessions/critic_notes.md` yourself — the Critic maintains it.
