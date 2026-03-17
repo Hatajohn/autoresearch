@@ -601,9 +601,22 @@ def test_grad_norm_and_checkpoint():
 
     os.unlink(ckpt_path)
 
+    # ── PC_EMA_DECAY: sweepable env var present with correct default ──────────
+    import train as _tr
+    assert hasattr(_tr, 'PC_EMA_DECAY'), \
+        "PC_EMA_DECAY not found in train module — env-var wiring missing"
+    # Default is 0.99; the test env does not override this var so it should be 0.99.
+    assert abs(_tr.PC_EMA_DECAY - 0.99) < 1e-9, \
+        f"PC_EMA_DECAY default expected 0.99, got {_tr.PC_EMA_DECAY}"
+    # alpha must be the algebraic complement — verify the coupling holds.
+    # (Tested indirectly below via the EMA update check.)
+
     # ── pc_ema update: buffer transitions from zero to non-zero after one step ─
-    # Mirrors the training loop: model.pc_ema.mul_(0.99).add_(layer_means, alpha=0.01)
+    # Mirrors the training loop:
+    #   model.pc_ema.mul_(PC_EMA_DECAY).add_(_last_layer_means, alpha=1-PC_EMA_DECAY)
     # Use a fresh model so we start from the known zero-init state.
+    ema_decay = _tr.PC_EMA_DECAY
+    ema_alpha = 1.0 - ema_decay
     model3, _ = _make_model_and_opt()
     assert (model3.pc_ema == 0).all(), "pc_ema not zero at init in fresh model"
     x3 = torch.randint(0, config.vocab_size, (2, 32), device=DEVICE)
@@ -615,13 +628,13 @@ def test_grad_norm_and_checkpoint():
     assert _m3_means.dtype == torch.float32, \
         f"layer_means dtype {_m3_means.dtype} should be float32"
     with torch.no_grad():
-        model3.pc_ema.mul_(0.99).add_(_m3_means, alpha=0.01)
-    # After one EMA step from zero: pc_ema = 0*0.99 + 0.01*layer_means = 0.01*layer_means
+        model3.pc_ema.mul_(ema_decay).add_(_m3_means, alpha=ema_alpha)
+    # After one EMA step from zero: pc_ema = 0*decay + alpha*layer_means = alpha*layer_means
     assert not (model3.pc_ema == 0).all(), \
         "pc_ema still all-zero after EMA update — training loop will feed static-zero targets"
-    expected_ema = 0.01 * _m3_means
+    expected_ema = ema_alpha * _m3_means
     assert torch.allclose(model3.pc_ema, expected_ema, atol=1e-6), \
-        "pc_ema after first step != 0.01 * layer_means (EMA formula broken)"
+        f"pc_ema after first step != {ema_alpha} * layer_means (EMA formula broken)"
 
     _dynamo.config.cache_size_limit = _orig_cache_limit
 
