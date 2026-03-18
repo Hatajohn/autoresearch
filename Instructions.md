@@ -76,8 +76,22 @@ RESUME_CHECKPOINT=checkpoint.pt TRAIN_TIME_BUDGET=1800 uv run train.py 2>&1 | te
 | `LOG_MIN_WINDOW` | `0` | Override minimum attention window (power of 2, ≥ 16; `0` = auto). |
 | `USE_TORCH_COMPILE` | `1` | `1`/`full` = whole-model compile (fastest steps, long cold start). `regional` = per–transformer-block compile ([PyTorch recipe](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html)) — shorter cold start. `0` = off. **Resume with the same mode the checkpoint used** (state_dict layout differs). |
 | `USE_STOCHASTIC_LAYERS` | `1` | Set `0` to disable stochastic layers (no KL from them). |
+| `CHECKPOINT_STEPS` | `300` | Every N steps, save full state to `checkpoint_latest.pt` for crash recovery (`0` = off). Same format as `checkpoint.pt` (resume with `RESUME_CHECKPOINT=checkpoint_latest.pt`). |
+| `EARLY_STOP_ENABLE` | `1` | Enable automatic save-and-stop (`1` = on, `0` = off). When triggered, saves `checkpoint_latest.pt` before stopping. |
+| `EARLY_STOP_MIN_STEPS` | `50` | Do not allow early-stop before this many training steps have completed. |
+| `EARLY_STOP_VAL_PATIENCE` | `3` | Stop after this many non-improving validation checks (`VAL_INTERVAL` must be > 0). |
+| `EARLY_STOP_VAL_MIN_DELTA` | `0.005` | Minimum `val_bpb` improvement required to reset validation patience. |
+| `EARLY_STOP_TRAIN_PATIENCE` | `40` | Raw-loss safety stop: stop after this many steps where raw loss stays meaningfully above the best seen this run. |
+| `EARLY_STOP_TRAIN_MIN_DELTA` | `0.02` | Allowed raw-loss drift above the best raw loss before counting toward the training-loss patience. |
 
-Checkpoint and config are defined in `train.py`; the default checkpoint path is `checkpoint.pt` in the current directory. At the end of a run the script prints a short summary including `val_bpb` and saves the model state to that path.
+**CLI:** `--checkpoint-steps N` overrides `CHECKPOINT_STEPS` (e.g. `uv run train.py --checkpoint-steps 200`).
+Early-stop settings can also be overridden on the command line, e.g.:
+
+```bash
+uv run train.py --early-stop-enable 1 --early-stop-min-steps 80 --early-stop-val-patience 4
+```
+
+Checkpoint and config are defined in `train.py`; the default checkpoint path is `checkpoint.pt` in the current directory. During training, `checkpoint_latest.pt` is overwritten every `CHECKPOINT_STEPS` steps when enabled, and it is also the file used for automatic recovery saves before an early stop. At the end of a run the script prints a short summary including `val_bpb` and saves to `checkpoint.pt`.
 
 ---
 

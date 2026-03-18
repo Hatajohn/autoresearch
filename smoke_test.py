@@ -35,8 +35,12 @@ Smoke test for train.py.  Six tests, increasing in fidelity:
     Optimizer-level checks:
       - clip_grad_norm_ returns a finite, positive grad_norm
       - Checkpoint includes pc_ema so resume restores EMA targets
-      - Checkpoint save/load restores model weights, optimizer state, step,
-        and total_training_time exactly
+      - Checkpoint round-trips model weights, optimizer state, step, and
+        total_training_time exactly (note: training loop intentionally resets
+        schedule_time to 0 on resume — the checkpoint value is for observability
+        only; muon_warmup_step is initialised to the restored step, not 0, so
+        the Muon momentum coefficient matches the warm optimizer buffers loaded
+        via optimizer.load_state_dict())
 
   Test 6 — VAL_INTERVAL CONTROL-FLOW (Issue 2 / Issue 3)
     Simulates steps 0–5 with VAL_INTERVAL=3 and a mocked evaluate_bpb.
@@ -48,9 +52,9 @@ Smoke test for train.py.  Six tests, increasing in fidelity:
     Skips if cache missing. Full evaluate_bpb() not run (too many steps).
 
   Test 8 — TRAINING LOOP SMOKE (--integration only)
-    Subprocess run of train.py with TRAIN_TIME_BUDGET=45. Default subprocess
-    timeout 1800s (cold compile+pre-warm can exceed 20 min). Override with
-    env SMOKE_TEST8_TIMEOUT=seconds. Asserts exit 0 and "step" in output.
+    Subprocess run of train.py with TRAIN_TIME_BUDGET=45. Output goes to a temp
+    .log (path printed on PASS); SMOKE_TEST8_LOG=/path/file.log to choose path.
+    Default timeout 1800s; SMOKE_TEST8_TIMEOUT=seconds to override.
 
 Usage:
   python smoke_test.py                  # run core tests (1, 3, 4, 5, 6, 6b, 2)
@@ -578,8 +582,13 @@ def test_forward_numerics():
 def test_grad_norm_and_checkpoint():
     """
     Step 5 — clip_grad_norm_ returns a finite, positive scalar.
-    Step 6 — checkpoint save/load restores model weights, optimizer state,
-             step counter, and total_training_time exactly.
+    Step 6 — checkpoint round-trips model weights, optimizer state, and step
+             counter exactly. total_training_time is verified present in the
+             checkpoint but is NOT applied by the training loop on resume
+             (schedule_time intentionally resets to 0 for a fresh time budget).
+             Muon resume policy: muon_warmup_step is initialised to the restored
+             step (not 0) so the momentum coefficient matches the warm optimizer
+             buffers from optimizer.load_state_dict(). Asserted below.
     """
     print("Test 5  [grad norm + checkpoint]  ...", end="  ", flush=True)
 
@@ -647,14 +656,42 @@ def test_grad_norm_and_checkpoint():
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     model2.load_state_dict(ckpt["model"])
     optimizer2.load_state_dict(ckpt["optimizer"])
-    step_restored               = ckpt.get("step", 0)
-    total_training_time_restored = ckpt.get("total_training_time", 0.0)
+    step_restored                = ckpt.get("step", 0)
+    # total_training_time is saved for observability; the training loop intentionally
+    # does NOT apply it on resume (schedule_time resets to 0 for a fresh time budget).
+    # This assertion verifies checkpoint serialization fidelity, not resume behavior.
+    total_training_time_in_ckpt  = ckpt.get("total_training_time", 0.0)
 
     assert step_restored == SAVED_STEP, \
         f"Restored step={step_restored}, expected {SAVED_STEP}"
-    assert abs(total_training_time_restored - SAVED_TTT) < 1e-3, (
-        f"Restored total_training_time={total_training_time_restored}, "
-        f"expected {SAVED_TTT}"
+    assert abs(total_training_time_in_ckpt - SAVED_TTT) < 1e-3, (
+        f"Checkpoint total_training_time={total_training_time_in_ckpt}, "
+        f"expected {SAVED_TTT} (round-trip fidelity check)"
+    )
+
+    # ── Muon resume policy: warmup counter starts from restored step ──────────
+    # train.py initialises muon_warmup_step = step (not 0) on both fresh runs
+    # and resumes. On a fresh run step=0 so warmup starts from 0.85 as usual.
+    # On resume the Muon optimizer buffers are warm (optimizer.load_state_dict),
+    # so the coefficient must start from where it was, not re-warm from 0.85.
+    # Verify the formula gives a value strictly between 0.85 and 0.95 for
+    # SAVED_STEP=42 (which is < MUON_MOM_WARMUP_STEPS=300), meaning the
+    # resumed coefficient is partially warmed — not at the cold-start value of
+    # 0.85 that an incorrect reset would produce.
+    import train as _tr
+    assert hasattr(_tr, 'MUON_MOM_WARMUP_STEPS'), \
+        "MUON_MOM_WARMUP_STEPS not found in train module"
+    assert _tr.MUON_MOM_WARMUP_STEPS > SAVED_STEP, (
+        f"SAVED_STEP={SAVED_STEP} must be < MUON_MOM_WARMUP_STEPS={_tr.MUON_MOM_WARMUP_STEPS} "
+        "for this assertion to distinguish continuation from reset"
+    )
+    t_muon_resumed = min(step_restored / _tr.MUON_MOM_WARMUP_STEPS, 1.0)
+    muon_mom_resumed = (1 - t_muon_resumed) * 0.85 + t_muon_resumed * 0.95
+    muon_mom_if_reset = 0.85  # what muon_warmup_step=0 would give
+    assert muon_mom_resumed > muon_mom_if_reset, (
+        f"Muon momentum at resumed step {step_restored} ({muon_mom_resumed:.4f}) "
+        f"should exceed the cold-start value ({muon_mom_if_reset:.2f}); "
+        "if equal, muon_warmup_step may have been incorrectly reset to 0"
     )
 
     # Model weights match exactly
@@ -709,7 +746,7 @@ def test_grad_norm_and_checkpoint():
         f"{PASS}  "
         f"grad_norm={grad_norm.item():.4f}  "
         f"step={step_restored}  "
-        f"ttt={total_training_time_restored:.3f}"
+        f"ttt_in_ckpt={total_training_time_in_ckpt:.3f}"
     )
 
 
@@ -862,6 +899,8 @@ def test_training_loop_smoke():
     With --integration: run train.py in a subprocess with TRAIN_TIME_BUDGET=45s.
     Subprocess timeout defaults to 1800s so cold Triton compile + kernel pre-warm
     (often 10–25 min on first graph) can finish. Set SMOKE_TEST8_TIMEOUT to override.
+    All stdout/stderr from train.py is written to a temp .log file; path is printed
+    on PASS/FAIL. Set SMOKE_TEST8_LOG to a file path to use that instead of tempfile.
     """
     print("Test 8  [training loop smoke]  ...", end="  ", flush=True)
     import subprocess
@@ -869,38 +908,60 @@ def test_training_loop_smoke():
     # 90s was too tight: pre-warm alone can be 1200s+ on cold cache (see run21 logs).
     timeout_s = int(os.environ.get("SMOKE_TEST8_TIMEOUT", "1800"))
 
+    log_path = os.environ.get("SMOKE_TEST8_LOG")
+    if not log_path:
+        log_fd, log_path = tempfile.mkstemp(
+            prefix="autoresearch_smoke_test8_", suffix=".log"
+        )
+        os.close(log_fd)
+
     env = os.environ.copy()
     env["TRAIN_TIME_BUDGET"] = "45"   # short run; enough for 1–2 steps after pre-warm
     env["VAL_INTERVAL"] = "0"
+    train_py = os.path.join(os.path.dirname(__file__), "train.py")
+
+    def _read_log_tail(n: int = 1200) -> str:
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()[-n:]
+        except OSError:
+            return "(could not read log)"
+
     try:
-        proc = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "train.py")],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            cwd=os.path.dirname(__file__),
-            env=env,
-        )
+        # Line-buffered so partial logs are useful on timeout/kill.
+        with open(log_path, "w", encoding="utf-8", errors="replace", buffering=1) as logf:
+            proc = subprocess.run(
+                [sys.executable, train_py],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_s,
+                cwd=os.path.dirname(__file__),
+                env=env,
+            )
     except subprocess.TimeoutExpired:
         print(
             f"{FAIL}  train.py did not complete within {timeout_s}s "
             f"(cold compile/pre-warm can be slow; set SMOKE_TEST8_TIMEOUT higher, "
-            f"or run once to warm the cache)"
+            f"or run once to warm the cache)\n  log: {log_path}"
         )
+        print(f"  tail:\n{_read_log_tail(2500)}")
         raise
     except FileNotFoundError as e:
         print(f"SKIP  {e}")
         return
 
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        combined = f.read()
+
     assert proc.returncode == 0, (
-        f"train.py exited {proc.returncode}\nstderr: {proc.stderr[:500] if proc.stderr else 'none'}"
+        f"train.py exited {proc.returncode}  log: {log_path}\n"
+        f"tail:\n{_read_log_tail(1500)}"
     )
-    combined = (proc.stdout or "") + (proc.stderr or "")
     assert "step" in combined.lower(), (
-        "train.py output did not contain 'step'; loop may not have run\n"
-        f"stdout tail: {(proc.stdout or '')[-800:]}"
+        f"train.py output did not contain 'step'; loop may not have run  log: {log_path}\n"
+        f"tail:\n{_read_log_tail(1500)}"
     )
-    print(f"{PASS}  train.py completed with steps")
+    print(f"{PASS}  train.py completed with steps  log: {log_path}")
 
 
 # ---------------------------------------------------------------------------

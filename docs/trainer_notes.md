@@ -1,7 +1,7 @@
 # Trainer Notes — pc-architecture-v2
 
 *Supplement to `architecture.md`. Read both before starting a run.*  
-*Updated after run 21 and pc_ema version-counter fix (Reviewer approved).*
+*Updated after runs 24 and 25.*
 
 ---
 
@@ -25,7 +25,7 @@ PC is self-supervised, adds no runtime inference cost, is compatible with standa
 
 ---
 
-## Implementation Status
+## Current State
 
 | Item | Status | Run / Commit |
 |------|--------|--------------|
@@ -42,16 +42,43 @@ PC is self-supervised, adds no runtime inference cost, is compatible with standa
 | Sigma statistics in PC diagnostic | ✅ Done | Run 20 |
 | StochasticLayer collapse confirmed | ✅ Confirmed | Run 20 — `sigma≈0.05`, unchanged from init |
 | EMA stabilization of pc_loss | ✅ Done | Run 22 — pc_loss settles after ~25 steps; final phase 1.3–3.7 |
+| Resume+compile optimizer rebind | ✅ Done | Confirmed by runs 24 and 25 |
+| Resume time-budget reset per process | ✅ Done | Reflected in run 25 training time |
+| Per-run EMA log debias + raw-loss logging | ✅ Done | Reflected in run 25 logs |
+| Best validation so far | ✅ Done | Run 25 — `val_bpb=1.537` |
 
 ---
 
-## Priority Order for Run 23 / Next Session
+## Priority Order
 
-1. **Run baseline ablation.** Train with `PC_WEIGHT=0.0`, same architecture and time budget as run 22. Compare val_bpb to run 22's 3.072. Without this, we cannot claim the PC loss helps. Log the run (e.g. run23) and add a row to the pc_loss history table below; update this priority list if the result dictates a follow-up.
+1. **[Unvalidated research claim] Run the matched `PC_WEIGHT=0` baseline.** Use the same architecture and a comparable time budget, ideally from fresh init for a clean comparison. Runs 24 and 25 show that the current lineage can keep improving, but they still do not establish that the PC auxiliary loss is responsible.
 
-2. **Optional: StochasticLayer ablation.** Run 22 pc_diag (step 25): sigma_bias still [0.049, 0.050] — collapsed. If you want to simplify, try disabling stochastic layers or `stoch_lr_scale=0` and compare val_bpb to run 22.
+2. **[Known architectural concern] Decide whether the collapsed stochastic layers deserve to stay.** They still sit near `sigma≈0.05` in diagnostics and their benefit remains unproven. An ablation is useful, but only after the baseline settles whether the PC path itself is worthwhile.
 
-3. **If baseline beats 3.072:** Document in trainer_notes. Consider removing or reducing the PC auxiliary loss and re-baselining. If baseline is worse than 3.072, the PC path is helping; note that in trainer_notes and consider further tuning or leaving as-is.
+3. **[Performance concern] Revisit throughput only after the baseline.** The stack still pays large compile/pre-warm costs and low MFU. That matters, but it is secondary to answering whether the auxiliary branch buys enough quality to justify any of its cost.
+
+---
+
+## Status By Category
+
+### Known bugs / correctness risks
+
+- No new run-blocking bug is confirmed in the latest long runs.
+- Resume used to fail on the first optimizer step after compile; the optimizer rebind fix is now validated by successful resumed runs.
+- Resume logging used to misreport debiased loss and time-budget semantics; the current run-25 behavior reflects the corrected per-run accounting.
+- The next code review should still treat checkpoint/resume, EMA updates, and training-time accounting as fragile paths because they have already produced misleading results once in this branch.
+
+### Performance concerns
+
+- Cold-cache compile and pre-warm remain expensive relative to short runs.
+- MFU is still very low for the achieved throughput.
+- Step-time outliers still appear in long runs even after the major recompilation bug was fixed.
+
+### Unvalidated research claims
+
+- The PC branch may be helping, but that claim is blocked on the missing `PC_WEIGHT=0` baseline.
+- The stochastic layers remain collapsed, so any claim that they help is weaker than the already-unproven claim about PC.
+- Better `val_bpb` in runs 24 and 25 does not yet imply better samples or more structured internal representations.
 
 ---
 
@@ -69,8 +96,10 @@ Runs 16–20 all showed pc_loss oscillating over multiple orders of magnitude du
 | 19 | 575 | (no new fix) |
 | 20 | 4,348 | PC_WEIGHT_WARMUP=50 (made it worse — see below) |
 | 21 | ~1,048 | EMA target buffer, PC_WEIGHT=0.02 — **cold cache; only 4 steps, inconclusive** |
-| 22 | ~3,490 | pc_ema update via .data.copy_(); **43 steps, val_bpb 3.072**; pc_loss stabilizes after ~25 |
-| 23 | N/A (PC_WEIGHT=0) | **Baseline ablation** — same config as 22, PC_WEIGHT=0. Compare val_bpb to 3.072. *Pending.* |
+| 22 | ~3,490 | pc_ema update via `.data.copy_()`; **43 steps, val_bpb 3.072**; pc_loss stabilizes after ~25 |
+| 23 | N/A (PC_WEIGHT=0) | Intended baseline ablation, but the resumed run failed before producing a comparable result |
+| 24 | ~178 early, ~0.50 late | 3 h continuation from checkpoint; **val_bpb 1.931**; resume+compile path completed successfully |
+| 25 | ~1.2 early, ~0.63 late | 3 h continuation with corrected per-run accounting; **val_bpb 1.537**; best result so far |
 
 **PC_WEIGHT_WARMUP was counterproductive** (run 20): shielding the backbone from PC pressure during early steps let it develop CE-optimal representations that were maximally *unpredictable* inter-layer. When the PC gradient ramped in, it found a harder target than without warmup, producing a higher pc_loss peak (4,348 vs 575). Warmup removed in run 21.
 

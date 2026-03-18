@@ -264,19 +264,20 @@ The EMA is updated in the training loop **outside** the compiled graph (so `forw
 
 ## Special Layers at a Glance
 
-| Layer | TemporalSummarizer | Value Embed | StochasticLayer | Skip dist |
-|-------|--------------------|-------------|-----------------|-----------|
-| 0 | — | — | — | 1 |
-| 1 | — | ✓ | — | 1 |
-| 2 | ✓ | — | ✓ | 2 |
-| 3 | — | ✓ | — | 2 |
-| 4 | ✓ | — | — | 3 |
-| 5 | — | ✓ | ✓ | 3 |
-| 6 | — | — | — | 4 |
-| 7 | — | ✓ | — | 4 |
+| Layer | TemporalSummarizer | Value Embed | StochasticLayer |
+|-------|--------------------|-------------|-----------------|
+| 0 | — | — | — |
+| 1 | — | ✓ | — |
+| 2 | ✓ | — | ✓ |
+| 3 | — | ✓ | — |
+| 4 | ✓ | — | — |
+| 5 | — | ✓ | ✓ |
+| 6 | — | — | — |
+| 7 | — | ✓ | — |
 
 TemporalSummarizer slots: `{n//3, 2*(n//3)}` = {2, 4} for n=8.
 StochasticLayer slots: `range(2, n_layer, 3)` = {2, 5} for n=8.
+Value-embed layers follow `has_ve(i, n_layer)`, which alternates by parity and always includes the final layer.
 
 ---
 
