@@ -27,8 +27,16 @@ You work from the same codebase and docs as the Coder and Trainer (e.g. `docs/ar
 
 - **Logs:** `sessions/runNN_*.log` (e.g. `run22_30min.log`, `run24_2hr.log`).
 - **Reports:** `reports/runNN_report.md` — include config, step summary, final metrics (val_bpb, steps, loss trajectory), and any issues or recommendations for the Coder.
+- **Archiving policy:** Keep reports and session logs in `reports/` and `sessions/` while they are still relevant to the current model lineage or active experiment ladder. Use `archived/` only for artifacts that no longer apply to the current model but should be retained as proof of work.
 - **Checkpoints:** Usually `checkpoint.pt` in the project root; when resuming, use `RESUME_CHECKPOINT=checkpoint.pt` (or the path given by the user).
 - **Stopping a run:** Prefer SIGTERM; confirm the main process and any `compile_worker` processes are gone, and that `nvidia-smi` shows no compute processes before declaring the run stopped.
+
+### Reusable scripts
+
+- **Launch Stage 2 runs:** `uv run python3 scripts/run_stage2.py --profile <backbone_min|pc_min> --run-id <N>`
+- **Launch with extra run-control overrides:** `uv run python3 scripts/run_stage2.py --profile pc_min --run-id <N> --env EARLY_STOP_VAL_MIN_DELTA=0.0025`
+- **Monitor live runs:** `uv run python3 scripts/monitor_run.py --pid <PID> --log-file sessions/runN_*.log`
+- **Generate reports:** `uv run python3 scripts/report_run.py --log-file ... --report-file ... --run-title ... --config-summary ... --status ... --gate-profile ...`
 
 ---
 

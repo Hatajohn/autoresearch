@@ -51,11 +51,12 @@ from model import GPT, GPTConfig, _NoStoch, StochasticLayer, AUX_HORIZONS  # noq
 # Run constants (env; no recompile when changed)
 # ---------------------------------------------------------------------------
 
-TIME_BUDGET = int(os.environ.get("TRAIN_TIME_BUDGET", "360"))
+TIME_BUDGET = int(os.environ.get("TRAIN_TIME_BUDGET", "86400"))
 RESUME_CHECKPOINT = os.environ.get("RESUME_CHECKPOINT", "")
 VAL_INTERVAL = int(os.environ.get("VAL_INTERVAL", "0"))
 # Periodic recovery checkpoint (checkpoint_latest.pt). Override with --checkpoint-steps.
 CHECKPOINT_STEPS_DEFAULT = int(os.environ.get("CHECKPOINT_STEPS", "300"))
+MAX_EPOCHS_DEFAULT = int(os.environ.get("MAX_EPOCHS", "1"))
 # Automatic save-and-stop policy. Validation patience is the primary stop signal;
 # raw train loss is a safety stop for clearly bad runs before more time is wasted.
 EARLY_STOP_ENABLE_DEFAULT = os.environ.get("EARLY_STOP_ENABLE", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -68,8 +69,9 @@ EARLY_STOP_TRAIN_MIN_DELTA_DEFAULT = float(os.environ.get("EARLY_STOP_TRAIN_MIN_
 # Initial steps excluded from throughput/MFU reporting (JIT-warmup outliers).
 # The LR/WD schedule clock and time-budget stop are NOT affected — both track from step 0.
 MFU_WARMUP_STEPS = 10
-# Muon momentum ramps from 0.85→0.95 over this many steps. Reset on resume
-# to stay aligned with the LR schedule, which also restarts from 0 on resume.
+# Muon momentum ramps from 0.85→0.95 over this many completed optimizer steps.
+# On resume, continue from the restored step so the coefficient matches the
+# warm optimizer buffers loaded from checkpoint.
 MUON_MOM_WARMUP_STEPS = 300
 # Explicit GC pass every N steps (keeps long-lived tensor refs from accumulating).
 GC_INTERVAL = 5000
@@ -79,16 +81,29 @@ GC_INTERVAL = 5000
 # ---------------------------------------------------------------------------
 
 # Architecture
-ASPECT_RATIO = 64
-HEAD_DIM = 128
-WINDOW_PATTERN = "LOG"
-DEPTH = 8
-DEVICE_BATCH_SIZE = 64
-PC_HEAD_DIM = int(os.environ.get("PC_HEAD_DIM", str(max(64, 8 * ASPECT_RATIO // 8))))
+DEPTH = int(os.environ.get("DEPTH", "8"))
+ASPECT_RATIO = int(os.environ.get("ASPECT_RATIO", "32"))
+MODEL_WIDTH_OVERRIDE = os.environ.get("MODEL_WIDTH", os.environ.get("WIDTH"))
+HEAD_DIM = 64
+WINDOW_PATTERN = os.environ.get("WINDOW_PATTERN", "LOG").strip().upper() or "LOG"
+DEVICE_BATCH_SIZE = 32
+if DEPTH <= 0:
+    raise ValueError(f"DEPTH must be positive, got {DEPTH}")
+if ASPECT_RATIO <= 0:
+    raise ValueError(f"ASPECT_RATIO must be positive, got {ASPECT_RATIO}")
+if MODEL_WIDTH_OVERRIDE is None:
+    TARGET_MODEL_WIDTH = DEPTH * ASPECT_RATIO
+    WIDTH_MODE = f"aspect_ratio({ASPECT_RATIO})"
+else:
+    TARGET_MODEL_WIDTH = int(MODEL_WIDTH_OVERRIDE)
+    if TARGET_MODEL_WIDTH <= 0:
+        raise ValueError(f"MODEL_WIDTH must be positive, got {TARGET_MODEL_WIDTH}")
+    WIDTH_MODE = "model_width"
+PC_HEAD_DIM = int(os.environ.get("PC_HEAD_DIM", str(max(64, TARGET_MODEL_WIDTH // DEPTH))))
 LOG_MIN_WINDOW = int(os.environ.get("LOG_MIN_WINDOW", "0"))
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19
+TOTAL_BATCH_SIZE = 2**18
 EMBEDDING_LR = 0.1
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04
@@ -138,6 +153,7 @@ class RunConfig:
     Keeps precedence logic local to __main__ and out of the training loop.
     """
     checkpoint_steps: int = CHECKPOINT_STEPS_DEFAULT
+    max_epochs: int = MAX_EPOCHS_DEFAULT
     early_stop_enable: bool = EARLY_STOP_ENABLE_DEFAULT
     early_stop_min_steps: int = EARLY_STOP_MIN_STEPS_DEFAULT
     early_stop_val_patience: int = EARLY_STOP_VAL_PATIENCE_DEFAULT
@@ -146,21 +162,33 @@ class RunConfig:
     early_stop_train_min_delta: float = EARLY_STOP_TRAIN_MIN_DELTA_DEFAULT
 
 
+_PENDING_STOP_REASON = None
+
+
+def _request_stop(reason: str) -> None:
+    global _PENDING_STOP_REASON
+    if _PENDING_STOP_REASON is None:
+        _PENDING_STOP_REASON = reason
+
+
+def _consume_stop_request() -> str | None:
+    global _PENDING_STOP_REASON
+    reason = _PENDING_STOP_REASON
+    _PENDING_STOP_REASON = None
+    return reason
+
+
 def _setup_signals():
     def _handle(signum, frame):
         name = getattr(signal.Signals(signum), "name", signum)
-        print(f"\n[train] Received {name} — exiting cleanly.", flush=True)
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        sys.exit(0)
+        _request_stop(f"received {name}")
+        print(f"\n[train] Received {name} — will checkpoint and stop at the next safe boundary.", flush=True)
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
 
 
 def _build_config(vocab_size):
-    base_dim = DEPTH * ASPECT_RATIO
+    base_dim = TARGET_MODEL_WIDTH
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
@@ -181,10 +209,10 @@ def _build_config(vocab_size):
     )
 
 
-def _rebind_optimizer_to_compiled(model, optimizer):
-    """After torch.compile, point optimizer at the compiled model's inner parameters."""
-    inner = getattr(model, "_orig_mod", None)
-    if inner is None:
+def _rebind_optimizer_to_model(model, optimizer):
+    """Point optimizer groups and state at the live model parameters."""
+    inner = getattr(model, "_orig_mod", model)
+    if not hasattr(inner, "_get_optimizer_param_lists"):
         return
     param_lists = inner._get_optimizer_param_lists()
     assert len(param_lists) == len(optimizer.param_groups)
@@ -192,6 +220,8 @@ def _rebind_optimizer_to_compiled(model, optimizer):
     new_flat = [p for lst in param_lists for p in lst]
     assert len(old_flat) == len(new_flat)
     for old_p, new_p in zip(old_flat, new_flat):
+        if old_p is new_p:
+            continue
         if old_p in optimizer.state:
             optimizer.state[new_p] = optimizer.state.pop(old_p)
     for i, group in enumerate(optimizer.param_groups):
@@ -207,8 +237,41 @@ def _get_lr_multiplier(progress):
     return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 
+def _validate_startup_config(run_cfg: RunConfig) -> None:
+    if TIME_BUDGET <= 0:
+        raise ValueError(f"TRAIN_TIME_BUDGET must be positive, got {TIME_BUDGET}")
+    if KL_WARMUP_STEPS <= 0:
+        raise ValueError(f"KL_WARMUP_STEPS must be positive, got {KL_WARMUP_STEPS}")
+    if VAL_INTERVAL < 0:
+        raise ValueError(f"VAL_INTERVAL must be non-negative, got {VAL_INTERVAL}")
+    if run_cfg.checkpoint_steps < 0:
+        raise ValueError(f"CHECKPOINT_STEPS must be non-negative, got {run_cfg.checkpoint_steps}")
+    if run_cfg.max_epochs < 0:
+        raise ValueError(f"MAX_EPOCHS must be non-negative, got {run_cfg.max_epochs}")
+    if run_cfg.early_stop_min_steps < 0:
+        raise ValueError(f"EARLY_STOP_MIN_STEPS must be non-negative, got {run_cfg.early_stop_min_steps}")
+    if run_cfg.early_stop_val_patience < 0:
+        raise ValueError(f"EARLY_STOP_VAL_PATIENCE must be non-negative, got {run_cfg.early_stop_val_patience}")
+    if run_cfg.early_stop_train_patience < 0:
+        raise ValueError(f"EARLY_STOP_TRAIN_PATIENCE must be non-negative, got {run_cfg.early_stop_train_patience}")
+    if run_cfg.early_stop_val_min_delta < 0:
+        raise ValueError(f"EARLY_STOP_VAL_MIN_DELTA must be non-negative, got {run_cfg.early_stop_val_min_delta}")
+    if run_cfg.early_stop_train_min_delta < 0:
+        raise ValueError(f"EARLY_STOP_TRAIN_MIN_DELTA must be non-negative, got {run_cfg.early_stop_train_min_delta}")
+
+
 def _get_kl_weight(step):
+    if KL_WARMUP_STEPS <= 0:
+        raise ValueError(f"KL_WARMUP_STEPS must be positive, got {KL_WARMUP_STEPS}")
     return KL_WEIGHT * min(step / KL_WARMUP_STEPS, 1.0)
+
+
+def _should_evaluate(step: int, val_interval: int) -> bool:
+    return val_interval > 0 and step > 0 and step % val_interval == 0
+
+
+def _should_stop_for_epoch_limit(next_epoch: int, max_epochs: int) -> bool:
+    return max_epochs > 0 and next_epoch > max_epochs
 
 
 def _format_hms(seconds):
@@ -219,20 +282,75 @@ def _format_hms(seconds):
     return f"{h:02d}::{m:02d}::{s:02d} ({t} seconds)"
 
 
-def _save_recovery_checkpoint(model, optimizer, config, step, schedule_time, path="checkpoint_latest.pt"):
+def _save_recovery_checkpoint(model, optimizer, config, step, schedule_time, run_state=None, path="checkpoint_latest.pt"):
+    if run_state is None:
+        run_state = {
+            "step": step,
+            "schedule_time": schedule_time,
+        }
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "config": asdict(config),
         "step": step,
         "total_training_time": schedule_time,
+        "run_state": run_state,
     }, path)
+
+
+def _load_run_state(ckpt: dict) -> dict:
+    run_state = dict(ckpt.get("run_state", {}))
+    if "step" not in run_state:
+        run_state["step"] = ckpt.get("step", 0)
+    if "schedule_time" not in run_state:
+        run_state["schedule_time"] = ckpt.get("total_training_time", 0.0)
+    return run_state
+
+
+def _normalize_state_dict_keys(state_dict: dict) -> dict:
+    """
+    Support eager checkpoints plus both whole-model and regional torch.compile
+    wrappers, which can introduce `_orig_mod` at different path segments.
+    """
+    normalized = {}
+    for key, value in state_dict.items():
+        key = key.removeprefix("_orig_mod.")
+        key = key.replace("._orig_mod.", ".")
+        normalized[key] = value
+    return normalized
+
+
+def _current_run_state(
+    *,
+    step: int,
+    schedule_time: float,
+    smooth_train_loss: float,
+    ema_smooth_steps: int,
+    best_val_bpb: float,
+    val_bad_checks: int,
+    best_raw_train_loss: float,
+    train_bad_steps: int,
+    throughput_time: float,
+) -> dict:
+    return {
+        "step": step,
+        "schedule_time": schedule_time,
+        "smooth_train_loss": smooth_train_loss,
+        "ema_smooth_steps": ema_smooth_steps,
+        "best_val_bpb": best_val_bpb,
+        "val_bad_checks": val_bad_checks,
+        "best_raw_train_loss": best_raw_train_loss,
+        "train_bad_steps": train_bad_steps,
+        "throughput_time": throughput_time,
+    }
 
 
 def main(run_cfg: "RunConfig | None" = None):
     if run_cfg is None:
         run_cfg = RunConfig()
+    _validate_startup_config(run_cfg)
 
+    _consume_stop_request()
     _setup_signals()
     t_start = time.time()
     torch.manual_seed(42)
@@ -287,30 +405,44 @@ def main(run_cfg: "RunConfig | None" = None):
     )
 
     # Resume policy (authoritative for all mutable state):
-    #   step:             restored — preserves checkpoint numbering and pc_ema buffer
-    #   schedule_time:    NOT restored — gives resumed run a fresh time budget;
-    #                     LR/WD schedules and time-budget stop restart from 0
-    #   optimizer state:  restored — preserves Muon momentum/second-momentum buffers
-    #   pc_ema:           restored via model.state_dict() (persistent buffer)
-    #   muon_warmup_step: set to restored step — Muon optimizer buffers are warm from
-    #                     optimizer.load_state_dict(), so the momentum coefficient must
-    #                     match (not re-warm from 0.85); on fresh run step=0 so warmup
-    #                     starts from scratch as expected
-    #   kl_weight:        uses restored step via _get_kl_weight(step) — continuation
-    #                     semantics; KL_WARMUP_STEPS=25 is short enough that any real
-    #                     resume will already be past warmup, so LR and KL schedules
-    #                     are not meaningfully misaligned in practice
+    #   model/optimizer:   restored — preserve parameter values and warm optimizer buffers
+    #   step:              restored — preserves checkpoint numbering and schedule position
+    #   schedule_time:     restored — crash recovery continues the interrupted run budget
+    #   pc_ema:            restored via model.state_dict() (persistent buffer)
+    #   smoothing/early-stop state: restored so resumed runs behave like uninterrupted ones
+    #   muon_warmup_step:  set to restored step — matches the warm optimizer buffers
+    #   kl_weight:         uses restored step via _get_kl_weight(step) — continuation semantics
     step = 0
     schedule_time = 0.0
+    smooth_train_loss = 0.0
+    ema_smooth_steps = 0
+    best_val_bpb = float("inf")
+    val_bad_checks = 0
+    best_raw_train_loss = float("inf")
+    train_bad_steps = 0
+    throughput_time = 0.0
+    stop_reason = None
     if RESUME_CHECKPOINT:
         ckpt = torch.load(RESUME_CHECKPOINT, map_location=device, weights_only=True)
-        state = ckpt["model"]
-        if any(k.startswith("_orig_mod.") for k in state.keys()):
-            state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+        state = _normalize_state_dict_keys(ckpt["model"])
         model.load_state_dict(state, assign=True)
         optimizer.load_state_dict(ckpt["optimizer"])
-        step = ckpt.get("step", 0)
-        print(f"Resumed from {RESUME_CHECKPOINT} at step {step}", flush=True)
+        _rebind_optimizer_to_model(model, optimizer)
+        run_state = _load_run_state(ckpt)
+        step = int(run_state.get("step", 0))
+        schedule_time = float(run_state.get("schedule_time", 0.0))
+        smooth_train_loss = float(run_state.get("smooth_train_loss", 0.0))
+        ema_smooth_steps = int(run_state.get("ema_smooth_steps", 0))
+        best_val_bpb = float(run_state.get("best_val_bpb", float("inf")))
+        val_bad_checks = int(run_state.get("val_bad_checks", 0))
+        best_raw_train_loss = float(run_state.get("best_raw_train_loss", float("inf")))
+        train_bad_steps = int(run_state.get("train_bad_steps", 0))
+        throughput_time = float(run_state.get("throughput_time", 0.0))
+        print(
+            f"Resumed from {RESUME_CHECKPOINT} at step {step} "
+            f"(schedule_time={schedule_time:.1f}s, val_bad_checks={val_bad_checks}, train_bad_steps={train_bad_steps})",
+            flush=True,
+        )
 
     t0 = time.time()
     if TORCH_COMPILE_MODE == "full":
@@ -318,7 +450,7 @@ def main(run_cfg: "RunConfig | None" = None):
         model = torch.compile(model, dynamic=False, fullgraph=True)
         t_compile = time.time() - t0
         print(f"  torch.compile done ({t_compile:.1f}s)", flush=True)
-        _rebind_optimizer_to_compiled(model, optimizer)
+        _rebind_optimizer_to_model(model, optimizer)
     elif TORCH_COMPILE_MODE == "regional":
         # https://docs.pytorch.org/tutorials/recipes/regional_compilation.html
         # Smaller graphs per Block → much shorter cold start than full-model compile;
@@ -329,6 +461,7 @@ def main(run_cfg: "RunConfig | None" = None):
             h[i] = torch.compile(h[i], dynamic=False, fullgraph=True)
         t_compile = time.time() - t0
         print(f"  regional torch.compile setup ({t_compile:.1f}s; first fwd will finish kernel gen)", flush=True)
+        _rebind_optimizer_to_model(model, optimizer)
     else:
         t_compile = 0.0
         print("Skipping torch.compile (USE_TORCH_COMPILE=0) — fast startup, slower steps.", flush=True)
@@ -365,6 +498,8 @@ def main(run_cfg: "RunConfig | None" = None):
     print(f"Grad accumulation steps: {grad_accum_steps}", flush=True)
     if run_cfg.checkpoint_steps > 0:
         print(f"Periodic checkpoint every {run_cfg.checkpoint_steps} steps → checkpoint_latest.pt", flush=True)
+    if run_cfg.max_epochs > 0:
+        print(f"Max epochs: {run_cfg.max_epochs} full shard pass(es)", flush=True)
     if run_cfg.early_stop_enable:
         print(
             "Early stop enabled: "
@@ -378,19 +513,10 @@ def main(run_cfg: "RunConfig | None" = None):
     print("Starting training loop...", flush=True)
 
     all_params = [p for g in optimizer.param_groups for p in g["params"]]
-    smooth_train_loss = 0.0
-    # Debiased EMA must use steps since this process started smoothing, not global
-    # step (resume resets smooth_train_loss but checkpoint step can be large).
-    ema_smooth_steps = 0
+    # Debiased EMA uses its own step counter so resumed runs keep the same smoothing state.
     t_start_training = time.time()
-    best_val_bpb = float("inf")
-    val_bad_checks = 0
-    best_raw_train_loss = float("inf")
-    train_bad_steps = 0
-    stop_reason = None
     # Throughput time for MFU reporting only; excludes MFU_WARMUP_STEPS initial steps.
-    # Does not drive schedules or time-budget stop — use schedule_time for those.
-    throughput_time = 0.0
+    # It is restored on resume so steady-MFU reporting stays continuous.
     # Muon momentum coefficient warmup counter. Initialised to `step` (not 0) so it
     # matches the restored Muon optimizer buffers: fresh run → step=0 → warmup starts
     # at 0.85; resumed run → step=N → coefficient starts at wherever it was, consistent
@@ -398,6 +524,31 @@ def main(run_cfg: "RunConfig | None" = None):
     muon_warmup_step = step
 
     while True:
+        pending_stop = _consume_stop_request()
+        if pending_stop is not None:
+            stop_reason = pending_stop
+            _save_recovery_checkpoint(
+                model,
+                optimizer,
+                config,
+                step,
+                schedule_time,
+                run_state=_current_run_state(
+                    step=step,
+                    schedule_time=schedule_time,
+                    smooth_train_loss=smooth_train_loss,
+                    ema_smooth_steps=ema_smooth_steps,
+                    best_val_bpb=best_val_bpb,
+                    val_bad_checks=val_bad_checks,
+                    best_raw_train_loss=best_raw_train_loss,
+                    train_bad_steps=train_bad_steps,
+                    throughput_time=throughput_time,
+                ),
+                path="checkpoint_latest.pt",
+            )
+            print(f"  saved checkpoint_latest.pt (step {step}) — {stop_reason}", flush=True)
+            break
+
         torch.cuda.synchronize()
         t0 = time.time()
         inner = getattr(model, "_orig_mod", model)
@@ -447,18 +598,22 @@ def main(run_cfg: "RunConfig | None" = None):
         with torch.no_grad():
             inner.pc_ema.data.copy_(inner.pc_ema * PC_EMA_DECAY + avg_layer_means * (1.0 - PC_EMA_DECAY))
 
+        # Treat `step` as completed optimizer updates from here onward.
+        step += 1
+        muon_warmup_step += 1
+
         # Fail check
         if math.isnan(train_loss) or train_loss > 100:
             print(f"FAIL step {step} loss={train_loss:.4f}", flush=True)
             torch.save({"model": model.state_dict(), "config": asdict(config), "step": step}, "checkpoint_failed.pt")
             sys.exit(1)
 
-        # Timing: schedule_time drives LR/WD schedules and time-budget stop (from step 0).
+        # Timing: schedule_time drives LR/WD schedules and the total run time budget.
         # throughput_time drives steady-MFU reporting only (excludes MFU_WARMUP_STEPS).
         torch.cuda.synchronize()
         dt = time.time() - t0
         schedule_time += dt
-        if step >= MFU_WARMUP_STEPS:
+        if step > MFU_WARMUP_STEPS:
             throughput_time += dt
 
         # Logging (debiased EMA; ema_smooth_steps so resume doesn't break the divisor)
@@ -474,6 +629,11 @@ def main(run_cfg: "RunConfig | None" = None):
               f"{tok_per_sec:,} tok/s | mfu: {mfu:.1f}% | epoch: {epoch} | elapsed: {schedule_time:.0f}s",
               flush=True)
         should_stop = False
+        pending_stop = _consume_stop_request()
+        signal_stop = pending_stop is not None
+        if signal_stop:
+            should_stop = True
+            stop_reason = pending_stop
 
         if PC_DIAG_INTERVAL > 0 and step > 0 and step % PC_DIAG_INTERVAL == 0:
             diag = inner.get_pc_diagnostics()
@@ -481,7 +641,7 @@ def main(run_cfg: "RunConfig | None" = None):
             sig = ",".join(f"{s:.3f}" for s in diag["sigma_bias_exp"]) if diag["sigma_bias_exp"] else "—"
             print(f"  pc_diag (step {step}): pc_weights=[{pw}] sigma_bias=[{sig}]", flush=True)
 
-        if VAL_INTERVAL > 0 and step > 0 and step % VAL_INTERVAL == 0:
+        if not signal_stop and _should_evaluate(step, VAL_INTERVAL):
             model.eval()
             with autocast_ctx, torch.no_grad():
                 val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
@@ -519,23 +679,45 @@ def main(run_cfg: "RunConfig | None" = None):
                         f"+ {run_cfg.early_stop_train_min_delta:.6f} for {train_bad_steps} steps"
                     )
 
+        if not should_stop and _should_stop_for_epoch_limit(epoch, run_cfg.max_epochs):
+            should_stop = True
+            stop_reason = (
+                f"completed max_epochs={run_cfg.max_epochs} "
+                f"(next batch would enter epoch {epoch})"
+            )
+
         save_recovery = (run_cfg.checkpoint_steps > 0 and step > 0 and step % run_cfg.checkpoint_steps == 0) or should_stop
         if save_recovery:
-            _save_recovery_checkpoint(model, optimizer, config, step, schedule_time)
+            _save_recovery_checkpoint(
+                model,
+                optimizer,
+                config,
+                step,
+                schedule_time,
+                run_state=_current_run_state(
+                    step=step,
+                    schedule_time=schedule_time,
+                    smooth_train_loss=smooth_train_loss,
+                    ema_smooth_steps=ema_smooth_steps,
+                    best_val_bpb=best_val_bpb,
+                    val_bad_checks=val_bad_checks,
+                    best_raw_train_loss=best_raw_train_loss,
+                    train_bad_steps=train_bad_steps,
+                    throughput_time=throughput_time,
+                ),
+                path="checkpoint_latest.pt",
+            )
             msg = f"  saved checkpoint_latest.pt (step {step})"
             if should_stop:
                 msg += f" — {stop_reason}"
             print(msg, flush=True)
 
-        if step == 0:
+        if step == 1:
             gc.collect()
             gc.freeze()
             gc.disable()
-        elif (step + 1) % GC_INTERVAL == 0:
+        elif step % GC_INTERVAL == 0:
             gc.collect()
-
-        step += 1
-        muon_warmup_step += 1
         if should_stop:
             break
         if schedule_time >= TIME_BUDGET:
@@ -562,6 +744,17 @@ def main(run_cfg: "RunConfig | None" = None):
         "config": asdict(config),
         "step": step,
         "total_training_time": schedule_time,
+        "run_state": _current_run_state(
+            step=step,
+            schedule_time=schedule_time,
+            smooth_train_loss=smooth_train_loss,
+            ema_smooth_steps=ema_smooth_steps,
+            best_val_bpb=best_val_bpb,
+            val_bad_checks=val_bad_checks,
+            best_raw_train_loss=best_raw_train_loss,
+            train_bad_steps=train_bad_steps,
+            throughput_time=throughput_time,
+        ),
     }, "checkpoint.pt")
 
     print("---")
@@ -577,6 +770,9 @@ def main(run_cfg: "RunConfig | None" = None):
     print(f"num_steps:        {step}")
     print(f"num_params_M:    {param_counts['total'] / 1e6:.1f}")
     print(f"depth:            {DEPTH}")
+    print(f"target_width:     {TARGET_MODEL_WIDTH}")
+    print(f"width_mode:       {WIDTH_MODE}")
+    print(f"window_pattern:   {WINDOW_PATTERN}")
 
 
 if __name__ == "__main__":
@@ -587,6 +783,13 @@ if __name__ == "__main__":
         default=None,
         metavar="N",
         help="Save checkpoint_latest.pt every N steps (0=off). Overrides CHECKPOINT_STEPS env; default 300.",
+    )
+    _ap.add_argument(
+        "--max-epochs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop after N full passes through the training shards (0=off). Overrides MAX_EPOCHS.",
     )
     _ap.add_argument(
         "--early-stop-enable",
@@ -628,6 +831,7 @@ if __name__ == "__main__":
     _cli = _ap.parse_args()
     _run_cfg = RunConfig(
         checkpoint_steps=(_cli.checkpoint_steps if _cli.checkpoint_steps is not None else CHECKPOINT_STEPS_DEFAULT),
+        max_epochs=(_cli.max_epochs if _cli.max_epochs is not None else MAX_EPOCHS_DEFAULT),
         early_stop_enable=(bool(_cli.early_stop_enable) if _cli.early_stop_enable is not None else EARLY_STOP_ENABLE_DEFAULT),
         early_stop_min_steps=(_cli.early_stop_min_steps if _cli.early_stop_min_steps is not None else EARLY_STOP_MIN_STEPS_DEFAULT),
         early_stop_val_patience=(_cli.early_stop_val_patience if _cli.early_stop_val_patience is not None else EARLY_STOP_VAL_PATIENCE_DEFAULT),

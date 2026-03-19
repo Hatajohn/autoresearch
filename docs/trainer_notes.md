@@ -1,7 +1,7 @@
 # Trainer Notes — pc-architecture-v2
 
 *Supplement to `architecture.md`. Read both before starting a run.*  
-*Updated after runs 24 and 25.*
+*Updated after runs 24 and 25 plus the latest training-loop cleanup pass.*
 
 ---
 
@@ -46,16 +46,33 @@ PC is self-supervised, adds no runtime inference cost, is compatible with standa
 | Resume time-budget reset per process | ✅ Done | Reflected in run 25 training time |
 | Per-run EMA log debias + raw-loss logging | ✅ Done | Reflected in run 25 logs |
 | Best validation so far | ✅ Done | Run 25 — `val_bpb=1.537` |
+| Run-config normalization for CLI/env run controls | ✅ Done | Latest cleanup pass |
+| `pc_ema` update uses full accumulated batch mean | ✅ Done | Latest cleanup pass |
+| Schedule/budget timing split from MFU timing | ✅ Done | Latest cleanup pass |
+| Line-oriented step logging for redirected logs | ✅ Done | Latest cleanup pass |
+| Resume load uses `torch.load(..., weights_only=True)` | ✅ Done | Latest cleanup pass |
+| `MAX_EPOCHS` run control + large failsafe time budget | ✅ Done | Latest cleanup pass |
 
 ---
 
 ## Priority Order
 
-1. **[Unvalidated research claim] Run the matched `PC_WEIGHT=0` baseline.** Use the same architecture and a comparable time budget, ideally from fresh init for a clean comparison. Runs 24 and 25 show that the current lineage can keep improving, but they still do not establish that the PC auxiliary loss is responsible.
+The experiment ladder in `docs/experiment_ladder.md` now governs run ordering. Summary:
 
-2. **[Known architectural concern] Decide whether the collapsed stochastic layers deserve to stay.** They still sit near `sigma≈0.05` in diagnostics and their benefit remains unproven. An ablation is useful, but only after the baseline settles whether the PC path itself is worthwhile.
+1. **[Stage 2 — mechanism viability] run27 → run28 → run29.** Validate the backbone and PC paths
+   in a reduced config (DEPTH=4, n_embd≈256, MAX_SEQ_LEN=1024) before committing time to target-
+   scale runs. Each run has a promotion gate documented in the ladder.
 
-3. **[Performance concern] Revisit throughput only after the baseline.** The stack still pays large compile/pre-warm costs and low MFU. That matters, but it is secondary to answering whether the auxiliary branch buys enough quality to justify any of its cost.
+2. **[Stage 3 — fixed-budget value] run30 (matched baseline) then run31 (PC on).** Run30 and run31
+   must use identical config, compile mode, and budget. The intended stopper is now `MAX_EPOCHS=1`
+   with a large `TRAIN_TIME_BUDGET` as the failsafe. Only after both complete can we claim PC
+   helps or does not help.
+
+3. **[Stage 3 — stochastic ablation] run32.** Only after the PC question is settled (runs 30+31).
+   Stochastic layers are collapsed (sigma≈0.05); their benefit is unproven.
+
+4. **Throughput tuning last.** MFU is low; this matters, but it is secondary to answering the
+   causal question about PC.
 
 ---
 
@@ -66,6 +83,7 @@ PC is self-supervised, adds no runtime inference cost, is compatible with standa
 - No new run-blocking bug is confirmed in the latest long runs.
 - Resume used to fail on the first optimizer step after compile; the optimizer rebind fix is now validated by successful resumed runs.
 - Resume logging used to misreport debiased loss and time-budget semantics; the current run-25 behavior reflects the corrected per-run accounting.
+- The latest cleanup pass also removed a silent `pc_ema` bias: EMA targets now use the mean of `layer_means` across all gradient-accumulation micro-batches, not just the final micro-batch in the step.
 - The next code review should still treat checkpoint/resume, EMA updates, and training-time accounting as fragile paths because they have already produced misleading results once in this branch.
 
 ### Performance concerns
@@ -73,6 +91,8 @@ PC is self-supervised, adds no runtime inference cost, is compatible with standa
 - Cold-cache compile and pre-warm remain expensive relative to short runs.
 - MFU is still very low for the achieved throughput.
 - Step-time outliers still appear in long runs even after the major recompilation bug was fixed.
+- Muon momentum warmup and GC cadence are now at least named constants, but they are still hand-chosen rather than derived from measured run scale.
+- The training schedule is still driven by `TRAIN_TIME_BUDGET`, so raising the time-budget safety fuse flattens progress-based LR/WD decay unless that schedule is decoupled later.
 
 ### Unvalidated research claims
 
@@ -126,6 +146,29 @@ The raw step-0 CE (from the pre-warm diagnostic) should be ~10.5 nats with curre
 **Cold-cache warning:** any code change that alters the compiled graph (new buffers, changed tensor shapes, new ops) invalidates the Triton kernel cache. Run 21 also suffered **per-step** recompilation: in-place mutation of `pc_ema` (`mul_`/`add_`) incremented the buffer version counter, so every forward invalidated the compiled graph. Fixed by updating via `new_ema = ...; model.pc_ema.data.copy_(new_ema)` so the buffer is not mutated in a way that triggers recompilation. Run 22 should see normal step times (~45–65s) after pre-warm; only the first run after a graph-changing edit will pay cold-cache pre-warm cost. Never draw conclusions from a cold-cache or pre-fix run.
 
 The PC head einsums and aux_lm_heads approximately halve throughput vs a plain transformer. The aux_lm_heads (`+0.15×CE_{t+2} + 0.05×CE_{t+4}`) have not been ablated — their contribution to val_bpb vs throughput cost is unquantified.
+
+**Timing/accounting note:** the training loop now distinguishes `schedule_time` from `throughput_time`. `schedule_time` is the clock used for LR / weight-decay progress and the time-budget stop, and it is restored on checkpoint resume. `throughput_time` is MFU-only, excludes the first `MFU_WARMUP_STEPS=10` optimizer steps, and is also restored so resumed runs keep consistent steady-state MFU summaries.
+
+### Logging and run controls
+
+Recent cleanup changed the operator-facing behavior of `train.py` in a few important ways:
+
+- Run controls are normalised through a small `RunConfig` object so CLI overrides and env defaults resolve in one place instead of being re-derived inside `main()`.
+- Per-step logs are now line-oriented, which makes `tee`/redirected session logs readable without relying on carriage-return progress rendering.
+- Periodic crash-recovery checkpoints go to `checkpoint_latest.pt` and are also written immediately before an early stop exits.
+- Final summaries now print a formatted `training_seconds` / `total_seconds` breakdown plus `stop_reason` when early stopping triggers.
+
+### Resume semantics
+
+The latest code path makes the intended resume policy explicit:
+
+- `step`, optimizer state, and `pc_ema` continue from the checkpoint
+- `schedule_time` continues from the checkpoint, so resumed runs keep the same wall-clock budget accounting
+- smoothing and early-stop counters continue from the checkpoint
+- Muon momentum warmup initialises from restored `step`, matching the warm optimizer buffers
+- `kl_weight` also continues from restored `step`
+- `throughput_time` continues from the checkpoint so MFU summaries stay comparable
+- checkpoint loading uses `torch.load(..., weights_only=True)`
 
 ### Window-context mismatch in PC targets
 

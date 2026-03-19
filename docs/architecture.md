@@ -357,6 +357,44 @@ The production step-0 loss as reported by the EMA-smoothed training metric is ty
 
 ---
 
+## Training Loop Controls
+
+The top-level training loop now separates three concepts that were previously easy to conflate:
+
+- `schedule_time`: wall-clock time accumulated inside the optimizer loop. It drives LR / weight-decay progress and the time-budget stop, and it is restored on resume.
+- `throughput_time`: a reporting-only clock used for steady-state MFU. It excludes the first `MFU_WARMUP_STEPS=10` optimizer steps so startup outliers do not distort the final MFU summary.
+- `step`: the global optimizer-step counter stored in checkpoints and restored on resume.
+
+This means a resumed run continues the interrupted schedule position rather than restarting the LR / weight-decay clock from zero.
+
+### Resume policy
+
+`RESUME_CHECKPOINT` restores:
+
+- model weights
+- optimizer state
+- `step`
+- `schedule_time`
+- persistent buffers such as `pc_ema`
+- smoothing and early-stop counters
+- MFU reporting state (`throughput_time`)
+
+Resumed runs therefore keep the same LR / weight-decay schedule position, time-budget accounting, and early-stop history they had before interruption.
+
+Additional schedule details:
+
+- Muon optimizer buffers are restored, so the Muon warmup counter is initialised from restored `step` rather than reset to zero.
+- `kl_weight` continues to use restored `step` via `_get_kl_weight(step)`.
+- Checkpoints are loaded with `torch.load(..., weights_only=True)` in the training script.
+
+### Logging and recovery checkpoints
+
+Per-step output is line-oriented rather than carriage-return progress updates, so redirected logs keep one readable record per step.
+
+When enabled, periodic recovery saves write `checkpoint_latest.pt`. The same file is also written immediately before an automatic early stop triggers. The final end-of-run checkpoint remains `checkpoint.pt`.
+
+---
+
 ## Environment Variables
 
 These are read once at launch and affect training setup or behavior without changing the compiled graph.
@@ -369,6 +407,15 @@ These are read once at launch and affect training setup or behavior without chan
 | `PC_HEAD_DIM` | `max(64, DEPTH*ASPECT_RATIO//8)` | Bottleneck dimension for PC prediction heads |
 | `LOG_MIN_WINDOW` | `0` | Minimum attention window for LOG pattern (0 = auto: `seq_len // n_layer`); set e.g. `64` to override |
 | `PC_DIAG_INTERVAL` | `50` | Steps between PC diagnostic prints (0 = off) |
-| `RESUME_CHECKPOINT` | `""` | Path to a `checkpoint.pt` to resume from; restores model weights, optimizer state, `step`, and `total_training_time` |
+| `RESUME_CHECKPOINT` | `""` | Path to a checkpoint to resume from; restores model/optimizer state, `step`, `schedule_time`, persistent buffers such as `pc_ema`, and recovery counters |
 | `VAL_INTERVAL` | `0` | Steps between mid-training `evaluate_bpb` calls (0 = disabled) |
 | `TRAIN_TIME_BUDGET` | `360` | Training wall-clock budget in seconds |
+| `CHECKPOINT_STEPS` | `300` | Save `checkpoint_latest.pt` every N optimizer steps (`0` = disabled) |
+| `EARLY_STOP_ENABLE` | `1` | Enable automatic save-and-stop behavior |
+| `EARLY_STOP_MIN_STEPS` | `50` | Minimum step before any early-stop rule may fire |
+| `EARLY_STOP_VAL_PATIENCE` | `3` | Allowed number of non-improving validation checks before stopping |
+| `EARLY_STOP_VAL_MIN_DELTA` | `0.005` | Minimum `val_bpb` improvement needed to reset validation patience |
+| `EARLY_STOP_TRAIN_PATIENCE` | `40` | Allowed number of raw-loss safety misses before stopping |
+| `EARLY_STOP_TRAIN_MIN_DELTA` | `0.02` | Allowed raw-loss drift above best before counting as a safety miss |
+| `USE_TORCH_COMPILE` | `1` | `1`/`full` = whole-model compile, `regional` = compile each transformer block, `0` = eager |
+| `USE_STOCHASTIC_LAYERS` | `1` | `0` disables stochastic layers entirely |

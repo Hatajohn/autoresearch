@@ -53,23 +53,46 @@ You are the Coder for the autoresearch project. Your job is to improve val_bpb (
 
 ## Next work (priority order)
 
-1. **Baseline ablation (PC_WEIGHT=0)**  
-   Run with the same config as run 22 but `PC_WEIGHT=0.0`. Same time budget. Run **without** resume (fresh init) so the result is comparable. Compare val_bpb to 3.072. Log the run and record the result in `docs/trainer_notes.md` (pc_loss history table and Implementation Status / Priority Order as needed).
+The experiment ladder in `docs/experiment_ladder.md` is the authoritative task list. This section
+summarizes the Coder's immediate responsibilities.
 
-   Example command (no resume):
-   ```bash
-   PC_WEIGHT=0 TRAIN_TIME_BUDGET=1800 PC_DIAG_INTERVAL=25 uv run train.py 2>&1 | tee sessions/run23_30min.log
-   ```
-   Then: extract final val_bpb from the log; update the pc_loss history table in `docs/trainer_notes.md` with the actual val_bpb and outcome.
+### 1. Prepare for run1 (code edits required)
 
-2. **Optional: Confirm resume+compile fix**  
-   Re-run a short resumed run to confirm the first `optimizer.step()` no longer raises: e.g. `RESUME_CHECKPOINT=checkpoint.pt TRAIN_TIME_BUDGET=300 uv run train.py 2>&1 | tee sessions/run23_resume_test.log`.
+Edit `train.py` hardcoded size knobs to the Stage 2 minimum-viable config:
 
-3. **Optional: StochasticLayer ablation**  
-   Stochastic layers are collapsed (sigma ≈ 0.05) and add compute. Try disabling them or setting `stoch_lr_scale=0` and compare val_bpb to run 22. If unchanged or better, document and consider keeping the simpler setup.
+```python
+DEPTH = 4          # was 8
+ASPECT_RATIO = 64  # keep this so DEPTH=4 yields n_embd=256
+HEAD_DIM = 64      # was 128
+DEVICE_BATCH_SIZE = 32  # was 64
+TOTAL_BATCH_SIZE = 2**18  # was 2**19
+```
 
-4. **After baseline:**  
-   If PC_WEIGHT=0 baseline is worse than 3.072, the PC path is helping. Update trainer_notes to state that. Consider further tuning (e.g. PC_WEIGHT, PC_EMA_DECAY) or leaving as-is and iterating on other ideas. If baseline is better, document and either remove or heavily reduce the PC auxiliary loss and re-baseline.
+Edit `prepare.py`: `MAX_SEQ_LEN = 1024` (was 2048).
+
+Verify the smoke test passes after the edit:
+
+```bash
+uv run smoke_test.py
+```
+
+Then hand off to the Runner to launch run1. See the exact command in `docs/experiment_ladder.md`.
+
+### 2. Run2, run3 (after run1 passes its gate)
+
+No additional code edits required between run1 and run2 (only env vars change). For run3,
+restore `DEPTH=8`, set `ASPECT_RATIO=32` to keep `n_embd=256`, and keep the reduced sequence
+length.
+
+### 3. Stage 3 (run30–run32): restore full config
+
+Restore all size knobs to their original values before run30. See the knob table in
+`docs/experiment_ladder.md`.
+
+### 4. Do not re-order or skip runs
+
+Each run has a promotion gate in the ladder. If a gate fails, document and open a Coder task;
+do not advance the run number.
 
 ---
 

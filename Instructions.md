@@ -62,12 +62,20 @@ TRAIN_TIME_BUDGET=1800 PC_DIAG_INTERVAL=25 uv run train.py 2>&1 | tee sessions/r
 RESUME_CHECKPOINT=checkpoint.pt TRAIN_TIME_BUDGET=1800 uv run train.py 2>&1 | tee sessions/run_resume.log
 ```
 
+Resume semantics continue the interrupted run state:
+
+- model weights, optimizer state, `step`, and persistent buffers such as `pc_ema` are restored
+- `schedule_time` is restored, so LR / weight-decay timing and the wall-clock budget continue from the checkpoint
+- smoothing and early-stop counters are restored, so resumed runs behave like uninterrupted training
+- Muon momentum warmup starts from restored `step` so it matches the warm optimizer buffers
+- KL warmup also follows restored `step`
+
 **Useful environment variables:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TRAIN_TIME_BUDGET` | `360` | Training time budget in seconds (wall clock). |
-| `RESUME_CHECKPOINT` | *(empty)* | Path to checkpoint file to resume from (e.g. `checkpoint.pt`). |
+| `RESUME_CHECKPOINT` | *(empty)* | Path to checkpoint file to resume from (e.g. `checkpoint.pt`). Restores weights, optimizer state, `step`, `schedule_time`, persistent buffers, and recovery counters so the interrupted run can continue. |
 | `VAL_INTERVAL` | `0` | Run validation every this many steps (`0` = disabled). |
 | `PC_WEIGHT` | `0.02` | Weight for the predictive-coding auxiliary loss. |
 | `PC_EMA_DECAY` | `0.99` | EMA decay for PC target buffers. |
@@ -91,7 +99,7 @@ Early-stop settings can also be overridden on the command line, e.g.:
 uv run train.py --early-stop-enable 1 --early-stop-min-steps 80 --early-stop-val-patience 4
 ```
 
-Checkpoint and config are defined in `train.py`; the default checkpoint path is `checkpoint.pt` in the current directory. During training, `checkpoint_latest.pt` is overwritten every `CHECKPOINT_STEPS` steps when enabled, and it is also the file used for automatic recovery saves before an early stop. At the end of a run the script prints a short summary including `val_bpb` and saves to `checkpoint.pt`.
+Checkpoint and config are defined in `train.py`; the default checkpoint path is `checkpoint.pt` in the current directory. During training, `checkpoint_latest.pt` is overwritten every `CHECKPOINT_STEPS` steps when enabled, and it is also the file used for automatic recovery saves before an early stop. Step output is line-oriented, so redirected logs keep one record per step. At the end of a run the script prints a short summary including `val_bpb`, formatted timing breakdowns, optional `stop_reason`, and saves to `checkpoint.pt`.
 
 ---
 

@@ -1,22 +1,0 @@
-Flash Attention 3 loaded (repo=kernels-community/flash-attn3, cap=(8, 9))
-Loading tokenizer...
-Vocab size: 8,192
-Model config: {'sequence_len': 2048, 'vocab_size': 8192, 'n_layer': 8, 'n_head': 4, 'n_kv_head': 4, 'n_embd': 512, 'window_pattern': 'SSSL'}
-Initializing model...
-  model init done
-Parameter counts:
-  wte                     : 4,194,304
-  value_embeds            : 16,777,216
-  lm_head                 : 4,194,304
-  transformer_matrices    : 29,360,640
-  scalars                 : 8
-  total                   : 54,526,472
-Estimated FLOPs per token: 2.642442e+08
-Scaling AdamW LRs by 1/sqrt(512/768) = 1.224745
-Compiling model (first run: slow, cached thereafter)...
-GPU memory after compile: 0.18GB allocated, 0.19GB reserved
-Prefetching first batch...
-Time budget: 420s
-Gradient accumulation steps: 8
-Starting training loop...
-step 00000 (0.0%) | loss: 9.010936 | pc_loss: 0.001953 | lrm: 1.00 | dt: 17874ms | tok/sec: 29,332 | mfu: 0.8% | epoch: 1 | remaining: 420s    step 00001 (0.0%) | loss: 8.869031 | pc_loss: 0.002066 | lrm: 1.00 | dt: 11280ms | tok/sec: 46,479 | mfu: 1.2% | epoch: 1 | remaining: 420s    step 00002 (0.0%) | loss: 8.379444 | pc_loss: 0.035736 | lrm: 1.00 | dt: 10056ms | tok/sec: 52,138 | mfu: 1.4% | epoch: 1 | remaining: 420s    step 00003 (0.0%) | loss: 7.931442 | pc_loss: 0.016771 | lrm: 1.00 | dt: 14986ms | tok/sec: 34,986 | mfu: 0.9% | epoch: 1 | remaining: 420s    step 00004 (0.0%) | loss: 7.559194 | pc_loss: 0.032154 | lrm: 1.00 | dt: 42257ms | tok/sec: 12,407 | mfu: 0.3% | epoch: 1 | remaining: 420s    step 00005 (0.0%) | loss: 7.285906 | pc_loss: 0.010418 | lrm: 1.00 | dt: 16906ms | tok/sec: 31,011 | mfu: 0.8% | epoch: 1 | remaining: 420s    step 00006 (0.0%) | loss: 7.075858 | pc_loss: 0.012628 | lrm: 1.00 | dt: 15039ms | tok/sec: 34,861 | mfu: 0.9% | epoch: 1 | remaining: 420s    step 00007 (0.0%) | loss: 6.871959 | pc_loss: 0.008662 | lrm: 1.00 | dt: 14007ms | tok/sec: 37,431 | mfu: 1.0% | epoch: 1 | remaining: 420s    step 00008 (0.0%) | loss: 6.696170 | pc_loss: 0.005713 | lrm: 1.00 | dt: 14901ms | tok/sec: 35,185 | mfu: 0.9% | epoch: 1 | remaining: 420s    step 00009 (0.0%) | loss: 6.545916 | pc_loss: 0.004882 | lrm: 1.00 | dt: 13911ms | tok/sec: 37,689 | mfu: 1.0% | epoch: 1 | remaining: 420s    step 00010 (0.0%) | loss: 6.429067 | pc_loss: 0.004121 | lrm: 1.00 | dt: 14955ms | tok/sec: 35,058 | mfu: 0.9% | epoch: 1 | remaining: 420s    step 00011 (0.0%) | loss: 6.322493 | pc_loss: 0.003384 | lrm: 1.00 | dt: 192491ms | tok/sec: 2,723 | mfu: 0.1% | epoch: 1 | remaining: 228s    step 00012 (45.8%) | loss: 6.224788 | pc_loss: 0.002880 | lrm: 1.00 | dt: 21964ms | tok/sec: 23,870 | mfu: 0.6% | epoch: 1 | remaining: 206s    step 00013 (51.1%) | loss: 6.136918 | pc_loss: 0.002587 | lrm: 0.98 | dt: 16668ms | tok/sec: 31,454 | mfu: 0.8% | epoch: 1 | remaining: 189s    step 00014 (55.0%) | loss: 6.060987 | pc_loss: 0.002304 | lrm: 0.90 | dt: 49031ms | tok/sec: 10,693 | mfu: 0.3% | epoch: 1 | remaining: 140s    step 00015 (66.7%) | loss: 5.996440 | pc_loss: 0.002000 | lrm: 0.67 | dt: 21051ms | tok/sec: 24,905 | mfu: 0.7% | epoch: 1 | remaining: 119s    step 00016 (71.7%) | loss: 5.929791 | pc_loss: 0.001851 | lrm: 0.57 | dt: 25804ms | tok/sec: 20,318 | mfu: 0.5% | epoch: 1 | remaining: 93s    step 00017 (77.9%) | loss: 5.871669 | pc_loss: 0.001735 | lrm: 0.44 | dt: 52051ms | tok/sec: 10,072 | mfu: 0.3% | epoch: 1 | remaining: 41s    step 00018 (90.3%) | loss: 5.818842 | pc_loss: 0.001648 | lrm: 0.19 | dt: 36222ms | tok/sec: 14,474 | mfu: 0.4% | epoch: 1 | remaining: 5s    step 00019 (98.9%) | loss: 5.769952 | pc_loss: 0.001596 | lrm: 0.02 | dt: 15889ms | tok/sec: 32,997 | mfu: 0.9% | epoch: 1 | remaining: 0s    

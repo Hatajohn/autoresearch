@@ -36,11 +36,23 @@ if not os.path.exists(args.checkpoint):
         "Make sure train.py has been run at least once."
     )
 
+def _normalize_state_dict_keys(state_dict):
+    """
+    Support checkpoints saved from eager, full-model torch.compile, and
+    regional compilation where individual blocks are wrapped in `_orig_mod`.
+    """
+    normalized = {}
+    for key, value in state_dict.items():
+        key = key.removeprefix("_orig_mod.")
+        key = key.replace("._orig_mod.", ".")
+        normalized[key] = value
+    return normalized
+
+
 ckpt = torch.load(args.checkpoint, map_location=device)
 config = GPTConfig(**ckpt["config"])
 model = GPT(config).to(device)
-# torch.compile prefixes all keys with "_orig_mod." — strip it if present
-state_dict = {k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()}
+state_dict = _normalize_state_dict_keys(ckpt["model"])
 model.load_state_dict(state_dict)
 model = model.to(torch.bfloat16)
 model.eval()

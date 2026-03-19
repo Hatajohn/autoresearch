@@ -1,22 +1,0 @@
-Flash Attention 3 loaded (repo=kernels-community/flash-attn3, cap=(8, 9))
-Loading tokenizer...
-Vocab size: 8,192
-Model config: {'sequence_len': 2048, 'vocab_size': 8192, 'n_layer': 8, 'n_head': 4, 'n_kv_head': 4, 'n_embd': 512, 'window_pattern': 'SSSL'}
-Initializing model...
-  model init done
-Parameter counts:
-  wte                     : 4,194,304
-  value_embeds            : 16,777,216
-  lm_head                 : 4,194,304
-  transformer_matrices    : 29,360,640
-  scalars                 : 16
-  total                   : 54,526,480
-Estimated FLOPs per token: 2.642443e+08
-Scaling AdamW LRs by 1/sqrt(512/768) = 1.224745
-Compiling model (first run: slow, cached thereafter)...
-GPU memory after compile: 0.18GB allocated, 0.19GB reserved
-Prefetching first batch...
-Time budget: 600s
-Gradient accumulation steps: 8
-Starting training loop...
-step 00000 (0.0%) | loss: 9.010936 | pc_loss: 0.000000 | lrm: 1.00 | dt: 429381ms | tok/sec: 1,221 | mfu: 0.0% | epoch: 1 | remaining: 600s    step 00001 (0.0%) | loss: 8.869038 | pc_loss: 0.000034 | lrm: 1.00 | dt: 35904ms | tok/sec: 14,602 | mfu: 0.4% | epoch: 1 | remaining: 600s    step 00002 (0.0%) | loss: 8.379495 | pc_loss: 0.012677 | lrm: 1.00 | dt: 46026ms | tok/sec: 11,391 | mfu: 0.3% | epoch: 1 | remaining: 600s    step 00003 (0.0%) | loss: 7.931480 | pc_loss: 0.017637 | lrm: 1.00 | dt: 41212ms | tok/sec: 12,721 | mfu: 0.3% | epoch: 1 | remaining: 600s    step 00004 (0.0%) | loss: 7.559155 | pc_loss: 0.049423 | lrm: 1.00 | dt: 310097ms | tok/sec: 1,690 | mfu: 0.0% | epoch: 1 | remaining: 600s    step 00005 (0.0%) | loss: 7.285591 | pc_loss: 0.011614 | lrm: 1.00 | dt: 72942ms | tok/sec: 7,187 | mfu: 0.2% | epoch: 1 | remaining: 600s    
